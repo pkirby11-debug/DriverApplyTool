@@ -254,7 +254,7 @@
 						 - DriverUpdate content download now uses standard OSDDownloadContent.exe via Task Sequence (boundary group aware)
 						 - All driver package version tracking retained: registry-based skip logic prevents reinstalling unchanged drivers
 						 - -ForceUpdate parameter still available to bypass version check when needed
-	5.3.0 - (2026-02-27) - Microsoft Surface package support and DAT version alignment:
+	5.3.0 - (2026-02-27) - Microsoft Surface package support, DAT version alignment, and manufacturer cleanup:
 						 - Added Microsoft Surface MSI package extraction: detects and extracts MSI-based Surface driver packages using msiexec administrative install
 						 - Added CAB archive extraction: detects and extracts CAB-based driver packages using expand.exe for Surface and other vendors
 						 - Added dedicated Microsoft manufacturer case in driver package model extraction for proper Surface model name handling
@@ -263,6 +263,9 @@
 						 - Added BareMetal offline registry stamp: writes driver package version to target OS offline registry hive after BareMetal installation
 						   so the first DriverUpdate run after imaging detects the already-installed package and skips re-downloading the same drivers
 						 - Version tracking now covers BareMetal (offline registry) and DriverUpdate (live registry) for full DAT overlay version alignment
+						 - Removed HP/Hewlett-Packard, Panasonic, Viglen, AZW, Fujitsu, Getac, Intel, and ByteSpeed manufacturer support
+						 - Supported manufacturers reduced to Dell, Lenovo, and Microsoft only
+						 - Removed Win32_BaseBoard CIM query (no longer needed without removed manufacturers)
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -374,7 +377,7 @@ param(
 	
 	[parameter(Mandatory = $false, ParameterSetName = "Debug", HelpMessage = "Override the automatically detected computer manufacturer when running in debug mode.")]
 	[ValidateNotNullOrEmpty()]
-	[ValidateSet("HP", "Hewlett-Packard", "Dell", "Lenovo", "Microsoft", "Fujitsu", "Panasonic", "Viglen", "AZW", "Getac", "Intel", "ByteSpeed")]
+	[ValidateSet("Dell", "Lenovo", "Microsoft")]
 	[string]$Manufacturer,
 	
 	[parameter(Mandatory = $false, ParameterSetName = "Debug", HelpMessage = "Override the automatically detected computer model when running in debug mode.")]
@@ -1222,7 +1225,6 @@ Process {
 		# Cache CIM queries to avoid redundant calls (performance improvement)
 		$Win32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
 		$Win32CSP = Get-CimInstance -ClassName "Win32_ComputerSystemProduct"
-		$Win32BB = Get-CimInstance -ClassName "Win32_BaseBoard"
 		$MSSystemInfo = Get-CimInstance -ClassName "MS_SystemInformation" -Namespace "root\WMI"
 
 		# Gather computer details based upon specific computer manufacturer
@@ -1232,16 +1234,6 @@ Process {
 				$ComputerDetails.Manufacturer = "Microsoft"
 				$ComputerDetails.Model = $Win32CS.Model.Trim()
 				$ComputerDetails.SystemSKU = $MSSystemInfo.SystemSKU
-			}
-			"*HP*" {
-				$ComputerDetails.Manufacturer = "HP"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Hewlett-Packard*" {
-				$ComputerDetails.Manufacturer = "HP"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
 			}
 			"*Dell*" {
 				$ComputerDetails.Manufacturer = "Dell"
@@ -1254,45 +1246,6 @@ Process {
 				$ComputerDetails.Manufacturer = "Lenovo"
 				$ComputerDetails.Model = $Win32CSP.Version.Trim()
 				$ComputerDetails.SystemSKU = ($Win32CS.Model.SubString(0, 4)).Trim()
-			}
-			"*Panasonic*" {
-				$ComputerDetails.Manufacturer = "Panasonic Corporation"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Viglen*" {
-				$ComputerDetails.Manufacturer = "Viglen"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $Win32BB.SKU.Trim()
-			}
-			"*AZW*" {
-				$ComputerDetails.Manufacturer = "AZW"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Fujitsu*" {
-				$ComputerDetails.Manufacturer = "Fujitsu"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $Win32BB.SKU.Trim()
-			}
-			"*Getac*" {
-				$ComputerDetails.Manufacturer = "Getac"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Intel*" {
-				$ComputerDetails.Manufacturer = "Intel"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-			}
-			"*ByteSpeed*" {
-				if ($Win32CS.Model.Trim() -like "*NUC*") {
-					$ComputerDetails.Manufacturer = "Intel"
-					$ComputerDetails.Model = $MSSystemInfo.BaseBoardProduct.Trim()
-				}
-				else {
-					$ComputerDetails.Manufacturer = "ByteSpeed"
-					$ComputerDetails.Model = $Win32CS.Model.Trim()
-				}
 			}
 			Default {
 				$ComputerDetails.Manufacturer = $Win32CS.Manufacturer.Trim()
@@ -1468,16 +1421,9 @@ Process {
 			}
 			
 			# Add driver package model details depending on manufacturer to custom driver package details object
-			# - HP computer models require the manufacturer name to be a part of the model name, other manufacturers do not
 			# - Microsoft Surface packages from DAT may include "Microsoft" in the model name (e.g. "Microsoft Surface Pro 9") or just "Surface Pro 9"
 			try {
 				switch ($DriverPackageItem.Manufacturer) {
-					"Hewlett-Packard" {
-						$DriverPackageDetails.Model = $DriverPackageItem.Name.Replace("Hewlett-Packard", "HP").Replace(" - ", ":").Split(":").Trim()[1]
-					}
-					"HP" {
-						$DriverPackageDetails.Model = $DriverPackageItem.Name.Replace(" - ", ":").Split(":").Trim()[1]
-					}
 					"Microsoft" {
 						# Extract model from package name, stripping manufacturer prefix if present
 						$SurfaceModel = $DriverPackageItem.Name.Replace("Microsoft", "").Replace(" - ", ":").Split(":").Trim()[1]
