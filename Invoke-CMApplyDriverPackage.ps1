@@ -1467,7 +1467,8 @@ Process {
 			switch ($ComputerDetectionMethod) {
 				"SystemSKU" {
 					if ([string]::IsNullOrEmpty($DriverPackageDetails.SystemSKU)) {
-						Write-CMLogEntry -Value "[DriverPackage:$($DriverPackageDetails.PackageID)]: Driver package was skipped due to missing SystemSKU values in description field" -Severity 2
+						Write-CMLogEntry -Value "[DriverPackage:$($DriverPackageDetails.PackageID)]: Missing SystemSKU in description field, falling back to computer model matching" -Severity 2
+						$ComputerDetectionMethodResult = Confirm-ComputerModel -DriverPackageInput $DriverPackageDetails.Model -ComputerData $ComputerData
 					}
 					else {
 						# Attempt to match against SystemSKU
