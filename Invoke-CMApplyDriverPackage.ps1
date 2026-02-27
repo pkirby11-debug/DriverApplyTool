@@ -117,7 +117,7 @@
 	Author:      Kevin Phillips
     Contact:     @kevinphillips
     Created:     2026-02-21
-    Updated:     2026-02-21
+    Updated:     2026-02-27
     
     Version history:
     1.0.0 - (2017-03-27) - Script created
@@ -254,6 +254,18 @@
 						 - DriverUpdate content download now uses standard OSDDownloadContent.exe via Task Sequence (boundary group aware)
 						 - All driver package version tracking retained: registry-based skip logic prevents reinstalling unchanged drivers
 						 - -ForceUpdate parameter still available to bypass version check when needed
+	5.3.0 - (2026-02-27) - Microsoft Surface package support, DAT version alignment, and manufacturer cleanup:
+						 - Added Microsoft Surface MSI package extraction: detects and extracts MSI-based Surface driver packages using msiexec administrative install
+						 - Added CAB archive extraction: detects and extracts CAB-based driver packages using expand.exe for Surface and other vendors
+						 - Added dedicated Microsoft manufacturer case in driver package model extraction for proper Surface model name handling
+						 - Fixed Surface model underscore matching: normalizes underscores to spaces in both package model and WMI model for reliable matching
+						 - Fixed missing PackageVersion property on fallback driver package details object (would cause null version in DriverUpdate tracking)
+						 - Added BareMetal offline registry stamp: writes driver package version to target OS offline registry hive after BareMetal installation
+						   so the first DriverUpdate run after imaging detects the already-installed package and skips re-downloading the same drivers
+						 - Version tracking now covers BareMetal (offline registry) and DriverUpdate (live registry) for full DAT overlay version alignment
+						 - Removed HP/Hewlett-Packard, Panasonic, Viglen, AZW, Fujitsu, Getac, Intel, and ByteSpeed manufacturer support
+						 - Supported manufacturers reduced to Dell, Lenovo, and Microsoft only
+						 - Removed Win32_BaseBoard CIM query (no longer needed without removed manufacturers)
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -365,7 +377,7 @@ param(
 	
 	[parameter(Mandatory = $false, ParameterSetName = "Debug", HelpMessage = "Override the automatically detected computer manufacturer when running in debug mode.")]
 	[ValidateNotNullOrEmpty()]
-	[ValidateSet("HP", "Hewlett-Packard", "Dell", "Lenovo", "Microsoft", "Fujitsu", "Panasonic", "Viglen", "AZW", "Getac", "Intel", "ByteSpeed")]
+	[ValidateSet("Dell", "Lenovo", "Microsoft")]
 	[string]$Manufacturer,
 	
 	[parameter(Mandatory = $false, ParameterSetName = "Debug", HelpMessage = "Override the automatically detected computer model when running in debug mode.")]
@@ -389,7 +401,7 @@ param(
 )
 Begin {
 	# Script version for logging and troubleshooting
-	$ScriptVersion = "5.2.0"
+	$ScriptVersion = "5.3.0"
 
 	# Load Microsoft.SMS.TSEnvironment COM object
 	if ($PSCmdLet.ParameterSetName -notlike "Debug") {
@@ -1213,7 +1225,6 @@ Process {
 		# Cache CIM queries to avoid redundant calls (performance improvement)
 		$Win32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
 		$Win32CSP = Get-CimInstance -ClassName "Win32_ComputerSystemProduct"
-		$Win32BB = Get-CimInstance -ClassName "Win32_BaseBoard"
 		$MSSystemInfo = Get-CimInstance -ClassName "MS_SystemInformation" -Namespace "root\WMI"
 
 		# Gather computer details based upon specific computer manufacturer
@@ -1223,16 +1234,6 @@ Process {
 				$ComputerDetails.Manufacturer = "Microsoft"
 				$ComputerDetails.Model = $Win32CS.Model.Trim()
 				$ComputerDetails.SystemSKU = $MSSystemInfo.SystemSKU
-			}
-			"*HP*" {
-				$ComputerDetails.Manufacturer = "HP"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Hewlett-Packard*" {
-				$ComputerDetails.Manufacturer = "HP"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
 			}
 			"*Dell*" {
 				$ComputerDetails.Manufacturer = "Dell"
@@ -1245,45 +1246,6 @@ Process {
 				$ComputerDetails.Manufacturer = "Lenovo"
 				$ComputerDetails.Model = $Win32CSP.Version.Trim()
 				$ComputerDetails.SystemSKU = ($Win32CS.Model.SubString(0, 4)).Trim()
-			}
-			"*Panasonic*" {
-				$ComputerDetails.Manufacturer = "Panasonic Corporation"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Viglen*" {
-				$ComputerDetails.Manufacturer = "Viglen"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $Win32BB.SKU.Trim()
-			}
-			"*AZW*" {
-				$ComputerDetails.Manufacturer = "AZW"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Fujitsu*" {
-				$ComputerDetails.Manufacturer = "Fujitsu"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $Win32BB.SKU.Trim()
-			}
-			"*Getac*" {
-				$ComputerDetails.Manufacturer = "Getac"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.BaseBoardProduct.Trim()
-			}
-			"*Intel*" {
-				$ComputerDetails.Manufacturer = "Intel"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-			}
-			"*ByteSpeed*" {
-				if ($Win32CS.Model.Trim() -like "*NUC*") {
-					$ComputerDetails.Manufacturer = "Intel"
-					$ComputerDetails.Model = $MSSystemInfo.BaseBoardProduct.Trim()
-				}
-				else {
-					$ComputerDetails.Manufacturer = "ByteSpeed"
-					$ComputerDetails.Model = $Win32CS.Model.Trim()
-				}
 			}
 			Default {
 				$ComputerDetails.Manufacturer = $Win32CS.Manufacturer.Trim()
@@ -1459,14 +1421,14 @@ Process {
 			}
 			
 			# Add driver package model details depending on manufacturer to custom driver package details object
-			# - HP computer models require the manufacturer name to be a part of the model name, other manufacturers do not
+			# - Microsoft Surface packages from DAT may include "Microsoft" in the model name (e.g. "Microsoft Surface Pro 9") or just "Surface Pro 9"
 			try {
 				switch ($DriverPackageItem.Manufacturer) {
-					"Hewlett-Packard" {
-						$DriverPackageDetails.Model = $DriverPackageItem.Name.Replace("Hewlett-Packard", "HP").Replace(" - ", ":").Split(":").Trim()[1]
-					}
-					"HP" {
-						$DriverPackageDetails.Model = $DriverPackageItem.Name.Replace(" - ", ":").Split(":").Trim()[1]
+					"Microsoft" {
+						# Extract model from package name, stripping manufacturer prefix if present
+						$SurfaceModel = $DriverPackageItem.Name.Replace("Microsoft", "").Replace(" - ", ":").Split(":").Trim()[1]
+						# Normalize underscores to spaces (DAT may create packages with underscores in Surface model names)
+						$DriverPackageDetails.Model = $SurfaceModel.Replace("_", " ")
 					}
 					default {
 						$DriverPackageDetails.Model = $DriverPackageItem.Name.Replace($DriverPackageItem.Manufacturer, "").Replace(" - ", ":").Split(":").Trim()[1]
@@ -1620,12 +1582,13 @@ Process {
 					foreach ($DriverPackageItem in $FallbackDriverPackages) {
 						# Construct custom object to hold values for current driver package properties used for matching with current computer details
 						$DriverPackageDetails = [PSCustomObject]@{
-							PackageName  = $DriverPackageItem.Name
-							PackageID    = $DriverPackageItem.PackageID
-							DateCreated  = $DriverPackageItem.SourceDate
-							Manufacturer = $DriverPackageItem.Manufacturer
-							OSName       = $null
-							Architecture = $null
+							PackageName    = $DriverPackageItem.Name
+							PackageID      = $DriverPackageItem.PackageID
+							PackageVersion = $DriverPackageItem.Version
+							DateCreated    = $DriverPackageItem.SourceDate
+							Manufacturer   = $DriverPackageItem.Manufacturer
+							OSName         = $null
+							Architecture   = $null
 						}
 						
 						# Add driver package OS architecture details to custom driver package details object
@@ -1776,7 +1739,7 @@ Process {
 			[parameter(Mandatory = $true, HelpMessage = "Specify the computer model value from the driver package object.")]
 			[ValidateNotNullOrEmpty()]
 			[string]$DriverPackageInput,
-			
+
 			[parameter(Mandatory = $true, HelpMessage = "Specify the computer data object.")]
 			[ValidateNotNullOrEmpty()]
 			[PSCustomObject]$ComputerData
@@ -1785,21 +1748,26 @@ Process {
 		$ModelDetectionResult = [PSCustomObject]@{
 			Detected = $null
 		}
-		
-		if ($DriverPackageInput -like $ComputerData.Model) {
+
+		# Normalize both values for comparison: trim whitespace and replace underscores with spaces
+		# This handles Microsoft Surface models where DAT may use underscores (e.g. "Surface_Pro_9" vs "Surface Pro 9")
+		$NormalizedPackageModel = $DriverPackageInput.Trim().Replace("_", " ")
+		$NormalizedComputerModel = $ComputerData.Model.Trim().Replace("_", " ")
+
+		if (($NormalizedPackageModel -like $NormalizedComputerModel) -or ($DriverPackageInput -like $ComputerData.Model)) {
 			# Computer model match found
 			Write-CMLogEntry -Value " - Matched computer model: $($ComputerData.Model)" -Severity 1
-			
+
 			# Set properties for custom object for return value
 			$ModelDetectionResult.Detected = $true
-			
+
 			return $ModelDetectionResult
 		}
 		else {
 			# Computer model match was not found
 			# Set properties for custom object for return value
 			$ModelDetectionResult.Detected = $false
-			
+
 			return $ModelDetectionResult
 		}
 	}
@@ -2213,6 +2181,100 @@ Process {
 		}
 	}
 
+	function Set-DriverPackageRegistryOffline {
+		<#
+		.SYNOPSIS
+			Writes the driver package version stamp to the offline target OS registry during BareMetal deployment.
+		.DESCRIPTION
+			During BareMetal OSD, the target OS registry is not live. This function loads the offline SOFTWARE
+			hive from the target OS drive, writes the version stamp, and unloads it. This ensures that subsequent
+			DriverUpdate runs detect the already-installed package and skip re-downloading it.
+		#>
+		param(
+			[parameter(Mandatory = $true)]
+			[ValidateNotNullOrEmpty()]
+			[string]$PackageID,
+
+			[parameter(Mandatory = $true)]
+			[ValidateNotNullOrEmpty()]
+			[string]$PackageVersion,
+
+			[parameter(Mandatory = $true)]
+			[ValidateNotNullOrEmpty()]
+			[string]$PackageName
+		)
+
+		$TargetDrive = $TSEnvironment.Value("OSDTargetSystemDrive")
+		if ([string]::IsNullOrEmpty($TargetDrive)) {
+			Write-CMLogEntry -Value " - Unable to determine target OS drive from OSDTargetSystemDrive, skipping offline registry stamp" -Severity 2
+			return
+		}
+
+		$OfflineHivePath = Join-Path -Path $TargetDrive -ChildPath "Windows\System32\config\SOFTWARE"
+		if (-not (Test-Path -Path $OfflineHivePath)) {
+			Write-CMLogEntry -Value " - Offline SOFTWARE hive not found at '$($OfflineHivePath)', skipping offline registry stamp" -Severity 2
+			return
+		}
+
+		$MountKey = "HKLM\OfflineDriverStamp"
+
+		try {
+			Write-CMLogEntry -Value " - Loading offline SOFTWARE hive from: $($OfflineHivePath)" -Severity 1
+			$LoadResult = Invoke-Executable -FilePath "reg.exe" -Arguments "load `"$($MountKey)`" `"$($OfflineHivePath)`""
+			if ($LoadResult -ne 0) {
+				Write-CMLogEntry -Value " - Failed to load offline registry hive (exit code: $($LoadResult)), skipping offline registry stamp" -Severity 2
+				return
+			}
+
+			$OfflineRegPath = "$($MountKey)\MSEndpointMgr\DriverPackage"
+
+			# Create registry key path
+			$CreateResult = Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /f"
+			if ($CreateResult -ne 0) {
+				Write-CMLogEntry -Value " - Failed to create offline registry key (exit code: $($CreateResult))" -Severity 2
+			}
+			else {
+				# Write version stamp values
+				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v PackageID /t REG_SZ /d `"$($PackageID)`" /f" | Out-Null
+				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v Version /t REG_SZ /d `"$($PackageVersion)`" /f" | Out-Null
+				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v PackageName /t REG_SZ /d `"$($PackageName)`" /f" | Out-Null
+				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v DateInstalled /t REG_SZ /d `"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`" /f" | Out-Null
+
+				# Parse and store version components for diagnostics
+				$VersionParts = Split-DriverPackageVersion -Version $PackageVersion
+				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v BaseVersion /t REG_SZ /d `"$($VersionParts.BaseVersion)`" /f" | Out-Null
+				if ($VersionParts.IsOverlay) {
+					Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v OverlayFingerprint /t REG_SZ /d `"$($VersionParts.Fingerprint)`" /f" | Out-Null
+					Write-CMLogEntry -Value " - Successfully wrote offline registry stamp (PackageID: $($PackageID), Version: $($PackageVersion), BaseVersion: $($VersionParts.BaseVersion), Overlay: $($VersionParts.Fingerprint))" -Severity 1
+				}
+				else {
+					Write-CMLogEntry -Value " - Successfully wrote offline registry stamp (PackageID: $($PackageID), Version: $($PackageVersion))" -Severity 1
+				}
+			}
+		}
+		catch [System.Exception] {
+			Write-CMLogEntry -Value " - Failed to write offline registry stamp. Error: $($_.Exception.Message)" -Severity 2
+		}
+		finally {
+			# Always attempt to unload the hive
+			try {
+				# Force garbage collection to release any handles on the hive
+				[gc]::Collect()
+				[gc]::WaitForPendingFinalizers()
+				$UnloadResult = Invoke-Executable -FilePath "reg.exe" -Arguments "unload `"$($MountKey)`""
+				if ($UnloadResult -ne 0) {
+					Write-CMLogEntry -Value " - WARNING: Failed to unload offline registry hive (exit code: $($UnloadResult)). This may resolve on next reboot." -Severity 2
+				}
+				else {
+					Write-CMLogEntry -Value " - Successfully unloaded offline registry hive" -Severity 1
+				}
+			}
+			catch [System.Exception] {
+				Write-CMLogEntry -Value " - WARNING: Exception while unloading offline registry hive: $($_.Exception.Message)" -Severity 2
+			}
+		}
+	}
+
 	function Invoke-DownloadDriverPackageContent {
 		Write-CMLogEntry -Value " - Attempting to download content files for matched driver package: $($DriverPackageList[0].PackageName)" -Severity 1
 
@@ -2268,6 +2330,75 @@ Process {
 			[ValidateNotNullOrEmpty()]
 			[string]$ContentLocation
 		)
+
+		# Detect if downloaded driver package content contains a Microsoft Surface MSI package that needs extraction
+		$DriverPackageMSIFile = Get-ChildItem -Path $ContentLocation -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -ne $DriverPackageMSIFile) {
+			Write-CMLogEntry -Value " - Downloaded driver package content contains a Microsoft Surface MSI package: $($DriverPackageMSIFile.Name)" -Severity 1
+			$MSIExtractPath = Join-Path -Path $ContentLocation -ChildPath "MSIExtract"
+
+			try {
+				if (-not (Test-Path -Path $MSIExtractPath)) {
+					New-Item -Path $MSIExtractPath -ItemType "Directory" -Force | Out-Null
+				}
+
+				# Use msiexec administrative install to extract MSI contents to get INF-based drivers
+				Write-CMLogEntry -Value " - Attempting to extract MSI package using administrative install to: $($MSIExtractPath)" -Severity 1
+				$MSIExitCode = Invoke-Executable -FilePath "msiexec.exe" -Arguments "/a `"$($DriverPackageMSIFile.FullName)`" /qn TARGETDIR=`"$($MSIExtractPath)`""
+
+				if ($MSIExitCode -eq 0) {
+					Write-CMLogEntry -Value " - Successfully extracted MSI package contents" -Severity 1
+
+					# Move extracted driver files into main content location and remove MSI extract directory
+					$ExtractedItems = Get-ChildItem -Path $MSIExtractPath -Recurse -Filter "*.inf"
+					if ($null -ne $ExtractedItems) {
+						Write-CMLogEntry -Value " - Found $($ExtractedItems.Count) INF driver file(s) in extracted MSI content" -Severity 1
+
+						# Copy extracted content preserving directory structure
+						Get-ChildItem -Path $MSIExtractPath | Copy-Item -Destination $ContentLocation -Recurse -Force -Container
+						Write-CMLogEntry -Value " - Successfully copied extracted driver files to content location" -Severity 1
+					}
+					else {
+						Write-CMLogEntry -Value " - WARNING: No INF driver files found in extracted MSI content, MSI may contain non-INF format drivers" -Severity 2
+					}
+
+					# Clean up MSI extract directory and original MSI file
+					Remove-Item -Path $MSIExtractPath -Recurse -Force -ErrorAction SilentlyContinue
+					Remove-Item -Path $DriverPackageMSIFile.FullName -Force -ErrorAction SilentlyContinue
+				}
+				else {
+					Write-CMLogEntry -Value " - Failed to extract MSI package, exit code: $($MSIExitCode). Attempting to continue with existing content." -Severity 2
+					Remove-Item -Path $MSIExtractPath -Recurse -Force -ErrorAction SilentlyContinue
+				}
+			}
+			catch [System.Exception] {
+				Write-CMLogEntry -Value " - An error occurred while extracting MSI package. Error message: $($_.Exception.Message)" -Severity 2
+				Remove-Item -Path $MSIExtractPath -Recurse -Force -ErrorAction SilentlyContinue
+			}
+		}
+
+		# Detect if downloaded driver package content contains a CAB archive that needs extraction
+		$DriverPackageCABFile = Get-ChildItem -Path $ContentLocation -Filter "*.cab" -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -ne $DriverPackageCABFile) {
+			Write-CMLogEntry -Value " - Downloaded driver package content contains a CAB archive: $($DriverPackageCABFile.Name)" -Severity 1
+
+			try {
+				Write-CMLogEntry -Value " - Attempting to extract CAB archive to: $($ContentLocation)" -Severity 1
+				$CABExitCode = Invoke-Executable -FilePath "expand.exe" -Arguments "`"$($DriverPackageCABFile.FullName)`" -F:* `"$($ContentLocation)`""
+
+				if ($CABExitCode -eq 0) {
+					Write-CMLogEntry -Value " - Successfully extracted CAB archive contents" -Severity 1
+					Remove-Item -Path $DriverPackageCABFile.FullName -Force -ErrorAction SilentlyContinue
+				}
+				else {
+					Write-CMLogEntry -Value " - Failed to extract CAB archive, exit code: $($CABExitCode). Attempting to continue with existing content." -Severity 2
+				}
+			}
+			catch [System.Exception] {
+				Write-CMLogEntry -Value " - An error occurred while extracting CAB archive. Error message: $($_.Exception.Message)" -Severity 2
+			}
+		}
+
 		# Detect if downloaded driver package content is a compressed archive that needs to be extracted before drivers are installed
 		$DriverPackageCompressedFile = Get-ChildItem -Path $ContentLocation -Filter "DriverPackage.*"
 		if ($null -ne $DriverPackageCompressedFile) {
@@ -2656,10 +2787,23 @@ Process {
 
 				Write-CMLogEntry -Value "[DriverPackageInstall]: Completed driver package install phase" -Severity 1
 
-				# For DriverUpdate deployments, record the installed package version to registry for future checks
-				if ($Script:DeploymentMode -eq "DriverUpdate") {
-					if (-not [string]::IsNullOrEmpty($MatchedPackageVersion)) {
-						Set-DriverPackageRegistry -PackageID $MatchedPackageID -PackageVersion $MatchedPackageVersion -PackageName $MatchedPackageName
+				# Record the installed package version to registry for future version checks
+				$InstalledPackageID = $DriverPackageList[0].PackageID
+				$InstalledPackageVersion = $DriverPackageList[0].PackageVersion
+				$InstalledPackageName = $DriverPackageList[0].PackageName
+
+				if (-not [string]::IsNullOrEmpty($InstalledPackageVersion)) {
+					switch ($Script:DeploymentMode) {
+						"DriverUpdate" {
+							# Write version stamp to live registry for subsequent DriverUpdate runs
+							Set-DriverPackageRegistry -PackageID $InstalledPackageID -PackageVersion $InstalledPackageVersion -PackageName $InstalledPackageName
+						}
+						"BareMetal" {
+							# Write version stamp to offline target OS registry so the first DriverUpdate run after imaging
+							# detects the already-installed package and skips re-downloading/re-applying the same drivers
+							Write-CMLogEntry -Value " - Writing driver package version stamp to offline target OS registry for future DriverUpdate version checks" -Severity 1
+							Set-DriverPackageRegistryOffline -PackageID $InstalledPackageID -PackageVersion $InstalledPackageVersion -PackageName $InstalledPackageName
+						}
 					}
 				}
 			}
