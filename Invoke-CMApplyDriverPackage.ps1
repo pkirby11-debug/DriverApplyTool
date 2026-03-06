@@ -78,6 +78,10 @@
 	Force driver package download and installation in DriverUpdate mode even if the device already has the current package version installed.
 	When not specified, the script checks a registry stamp from the previous installation and skips the download if versions match.
 
+.PARAMETER NetworkLogPath
+	Specify a UNC path to write a duplicate log file for remote troubleshooting (e.g. '\\server\share\OSDLogs').
+	The log file is named ApplyDriverPackage_<ComputerName>_<Timestamp>.log. Network write failures are non-fatal.
+
 .EXAMPLE
 	# Detect, download and apply drivers during OS deployment with ConfigMgr:
 	.\Invoke-CMApplyDriverPackage.ps1 -BareMetal -Endpoint 'CM01.domain.com' -TargetOSName 'Windows 10' -TargetOSVersion '1909'
@@ -108,6 +112,9 @@
 
 	# Run in a debug mode for testing purposes and overriding the automatically detected computer details (could be executed basically anywhere):
 	.\Invoke-CMApplyDriverPackage.ps1 -DebugMode -Endpoint 'CM01.domain.com' -UserName 'svc@domain.com' -Password 'svc-password' -TargetOSName 'Windows 10' -TargetOSVersion '1909' -Manufacturer 'Dell' -ComputerModel 'Precision 5520' -SystemSKU '07BF'
+
+	# Detect, download and apply drivers with remote network logging for troubleshooting:
+	.\Invoke-CMApplyDriverPackage.ps1 -BareMetal -Endpoint 'CM01.domain.com' -TargetOSName 'Windows 11' -TargetOSVersion '24H2' -NetworkLogPath '\\fileserver\OSDLogs'
 
 	# Detect, download and apply drivers during OS deployment with ConfigMgr and use an XML package as the source of driver package details instead of the AdminService:
 	.\Invoke-CMApplyDriverPackage.ps1 -XMLPackage -XMLDeploymentType BareMetal -TargetOSName 'Windows 10' -TargetOSVersion '1909' -TargetOSArchitecture 'x64'
@@ -265,6 +272,13 @@
 						 - Version tracking now covers BareMetal (offline registry) and DriverUpdate (live registry) for full DAT overlay version alignment
 						 - Removed HP/Hewlett-Packard, Panasonic, Viglen, AZW, Fujitsu, Getac, Intel, and ByteSpeed manufacturer support
 						 - Supported manufacturers reduced to Dell, Lenovo, and Microsoft only
+	5.3.1 - (2026-03-06) - Network logging, DP visibility, and improved diagnostics:
+						 - Added -NetworkLogPath parameter: writes duplicate log to a UNC path for remote troubleshooting without physical device access
+						 - Added Distribution Point logging: logs Management Point (pre/post download) and content source DP after package download for boundary group troubleshooting
+						 - Added Write-Output diagnostic statements at critical decision points (computer details, package matching, errors) for SMSTS.log visibility
+						 - Improved terminating error messages: each error path now provides specific details (model, SKU, error message) instead of generic "InnerTerminatingFailure"
+						 - Added early diagnostic output in Begin block before TSEnvironment initialization
+						 - TSEnvironment COM object failure now outputs error details and exits with code 1 instead of code 0
 						 - Removed Win32_BaseBoard CIM query (no longer needed without removed manufacturers)
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
@@ -397,11 +411,44 @@ param(
 
 	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate", HelpMessage = "Force driver package download and installation even if the device already has the current version installed.")]
 	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
-	[switch]$ForceUpdate
+	[switch]$ForceUpdate,
+
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Specify a UNC path to write a duplicate log file for remote troubleshooting, e.g. '\\\\server\\share\\OSDLogs'.")]
+	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
+	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
+	[parameter(Mandatory = $false, ParameterSetName = "PreCache")]
+	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
+	[parameter(Mandatory = $false, ParameterSetName = "XMLPackage")]
+	[ValidateNotNullOrEmpty()]
+	[string]$NetworkLogPath
 )
 Begin {
 	# Script version for logging and troubleshooting
-	$ScriptVersion = "5.3.0"
+	$ScriptVersion = "5.3.1"
+
+	# Early diagnostic output to SMSTS.log (Write-Output appears in TS logs even if script logging isn't initialized)
+	Write-Output "ApplyDriverPackage: Script version $($ScriptVersion) starting"
+	Write-Output "ApplyDriverPackage: Parameter set: $($PSCmdLet.ParameterSetName)"
+	if ($PSBoundParameters.ContainsKey("Endpoint")) { Write-Output "ApplyDriverPackage: Endpoint: $($Endpoint)" }
+	if ($PSBoundParameters.ContainsKey("TargetOSName")) { Write-Output "ApplyDriverPackage: TargetOSName: $($TargetOSName)" }
+	if ($PSBoundParameters.ContainsKey("TargetOSVersion")) { Write-Output "ApplyDriverPackage: TargetOSVersion: $($TargetOSVersion)" }
+	if ($PSBoundParameters.ContainsKey("NetworkLogPath")) { Write-Output "ApplyDriverPackage: NetworkLogPath: $($NetworkLogPath)" }
+
+	# Generate unique network log file name using computer name and timestamp
+	if (-not([string]::IsNullOrEmpty($NetworkLogPath))) {
+		$NetworkLogFileName = "ApplyDriverPackage_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+		$Script:NetworkLogFilePath = Join-Path -Path $NetworkLogPath -ChildPath $NetworkLogFileName
+		try {
+			if (-not(Test-Path -Path $NetworkLogPath)) {
+				New-Item -Path $NetworkLogPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+			}
+			Write-Output "ApplyDriverPackage: Network log will be written to: $($Script:NetworkLogFilePath)"
+		}
+		catch {
+			Write-Output "ApplyDriverPackage: WARNING - Could not access network log path: $($NetworkLogPath). Error: $($_.Exception.Message)"
+			$Script:NetworkLogFilePath = $null
+		}
+	}
 
 	# Load Microsoft.SMS.TSEnvironment COM object
 	if ($PSCmdLet.ParameterSetName -notlike "Debug") {
@@ -409,10 +456,11 @@ Begin {
 			$TSEnvironment = New-Object -ComObject "Microsoft.SMS.TSEnvironment" -ErrorAction Stop
 		}
 		catch [System.Exception] {
-			Write-Warning -Message "Unable to construct Microsoft.SMS.TSEnvironment object"; exit
+			Write-Output "ApplyDriverPackage: FATAL - Unable to construct Microsoft.SMS.TSEnvironment object. Error: $($_.Exception.Message)"
+			Write-Warning -Message "Unable to construct Microsoft.SMS.TSEnvironment object"; exit 1
 		}
 	}
-	
+
 	# Enable TLS 1.2 and TLS 1.3 support for secure connections
 	try {
 		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
@@ -480,6 +528,16 @@ Process {
 		}
 		catch [System.Exception] {
 			Write-Warning -Message "Unable to append log entry to ApplyDriverPackage.log file. Error message at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
+		}
+
+		# Write duplicate log entry to network path if specified
+		if (-not([string]::IsNullOrEmpty($Script:NetworkLogFilePath))) {
+			try {
+				Out-File -InputObject $LogText -Append -NoClobber -Encoding UTF8 -FilePath $Script:NetworkLogFilePath -ErrorAction Stop
+			}
+			catch {
+				# Network logging failures are non-fatal - silently continue
+			}
 		}
 	}
 	
@@ -584,16 +642,18 @@ Process {
 			}
 			else {
 				Write-CMLogEntry -Value " - Failed to download package content with PackageID '$($PackageID)'. Return code was: $($ReturnCode)" -Severity 3
-				
-				# Throw terminating error				
-				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+				Write-Output "ApplyDriverPackage: FATAL - Package content download failed for PackageID '$($PackageID)' with return code $($ReturnCode)"
+
+				# Throw terminating error
+				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Package content download failed for PackageID '$($PackageID)' with return code $($ReturnCode). Verify package content is distributed to a DP accessible from WinPE."))
 			}
 		}
 		catch [System.Exception] {
 			Write-CMLogEntry -Value " - An error occurred while attempting to download package content. Error message: $($_.Exception.Message)" -Severity 3
-			
-			# Throw terminating error			
-			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+			Write-Output "ApplyDriverPackage: FATAL - Package content download error: $($_.Exception.Message)"
+
+			# Throw terminating error
+			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Package content download error: $($_.Exception.Message)"))
 		}
 		
 		return $ReturnCode
@@ -714,9 +774,10 @@ Process {
 					}
 					else {
 						Write-CMLogEntry -Value " - Required service account user name could not be determined from TS environment variable" -Severity 3
+						Write-Output "ApplyDriverPackage: FATAL - MDMUserName TS variable is empty or not set"
 
 						# Throw terminating error
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "MDMUserName TS variable is empty or not set. Create a Set Task Sequence Variable step before this step to set MDMUserName."))
 					}
 				}
 			}
@@ -742,9 +803,10 @@ Process {
 					}
 					else {
 						Write-CMLogEntry -Value " - Required service account password could not be determined from TS environment variable" -Severity 3
+						Write-Output "ApplyDriverPackage: FATAL - MDMPassword TS variable is empty or not set"
 
 						# Throw terminating error
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "MDMPassword TS variable is empty or not set. Create a Set Task Sequence Variable step before this step to set MDMPassword."))
 					}
 				}
 			}
@@ -815,9 +877,10 @@ Process {
 				}
 				else {
 					Write-CMLogEntry -Value " - Detected that script was not running in WinPE of a bare metal deployment type, this is not a supported scenario" -Severity 3
-					
-					# Throw terminating error					
-					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					Write-Output "ApplyDriverPackage: FATAL - BareMetal mode requires WinPE but _SMSTSInWinPE is not true"
+
+					# Throw terminating error
+					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "BareMetal deployment type requires script to run in WinPE phase. Ensure the Apply Driver Package step runs before the Setup Windows and ConfigMgr step."))
 				}
 			}
 			"Debug" {
@@ -957,15 +1020,16 @@ Process {
 				}
 				catch [System.Exception] {
 					Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint. Error message: $($PSItem.Exception.Message)" -Severity 3
-					
-					# Throw terminating error					
-					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					Write-Output "ApplyDriverPackage: FATAL - AdminService external endpoint connection failed: $($PSItem.Exception.Message)"
+
+					# Throw terminating error
+					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "AdminService external endpoint connection failed: $($PSItem.Exception.Message)"))
 				}
 			}
 			"Internal" {
 				$AdminServiceUri = $AdminServiceURL + $Resource
 				Write-CMLogEntry -Value " - Calling AdminService endpoint with URI: $($AdminServiceUri)" -Severity 1
-				
+
 				try {
 					# Call AdminService endpoint to retrieve package data
 					$AdminServiceResponse = Invoke-RestMethod -Method Get -Uri $AdminServiceUri -Credential $Credential -ErrorAction Stop
@@ -985,16 +1049,18 @@ Process {
 					}
 					catch [System.Exception] {
 						Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint. Error message: $($PSItem.Exception.Message)" -Severity 3
+						Write-Output "ApplyDriverPackage: FATAL - AdminService connection failed after certificate bypass retry: $($PSItem.Exception.Message)"
 
 						# Throw terminating error
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "AdminService connection failed after certificate bypass retry: $($PSItem.Exception.Message)"))
 					}
 				}
 				catch {
 					Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint. Error message: $($PSItem.Exception.Message)" -Severity 3
+					Write-Output "ApplyDriverPackage: FATAL - AdminService connection to $($AdminServiceUri) failed: $($PSItem.Exception.Message)"
 
 					# Throw terminating error
-					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "AdminService connection to $($AdminServiceUri) failed: $($PSItem.Exception.Message)"))
 				}
 			}
 		}
@@ -1200,9 +1266,10 @@ Process {
 			}
 			else {
 				Write-CMLogEntry -Value " - Retrieved a total of '0' driver packages from $($Script:PackageSource) matching operational mode: $($OperationalMode)" -Severity 3
-				
-				# Throw terminating error				
-				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+				Write-Output "ApplyDriverPackage: FATAL - No driver packages found in AdminService matching filter '$($Filter)' and operational mode '$($OperationalMode)'"
+
+				# Throw terminating error
+				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No driver packages found in AdminService matching filter '$($Filter)' and operational mode '$($OperationalMode)'. Verify packages exist with '$($Filter)' in the name."))
 			}
 		}
 		catch [System.Exception] {
@@ -1344,9 +1411,10 @@ Process {
 		
 		if (($ComputerDetection.ModelDetected -eq $false) -and ($ComputerDetection.SystemSKUDetected -eq $false)) {
 			Write-CMLogEntry -Value " - Computer model and SystemSKU values are missing, script execution is not allowed since required values to continue could not be gathered" -Severity 3
-			
-			# Throw terminating error			
-			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+			Write-Output "ApplyDriverPackage: FATAL - Both computer Model and SystemSKU are null/empty. Cannot match driver packages."
+
+			# Throw terminating error
+			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Both computer Model and SystemSKU are null or empty. WMI query returned no usable values for driver package matching."))
 		}
 		else {
 			Write-CMLogEntry -Value " - Computer details successfully verified" -Severity 1
@@ -1631,16 +1699,18 @@ Process {
 				}
 				else {
 					Write-CMLogEntry -Value " - Retrieved a total of '0' fallback driver packages from AdminService matching operational mode: $($OperationalMode)" -Severity 3
-					
-					# Throw terminating error					
-					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					Write-Output "ApplyDriverPackage: FATAL - No fallback driver packages found with 'Driver Fallback Package' in the name"
+
+					# Throw terminating error
+					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No fallback driver packages found. Create a package named 'Driver Fallback Package' with the appropriate manufacturer, OS, and architecture for $($ComputerData.Manufacturer)."))
 				}
 			}
 			catch [System.Exception] {
 				Write-CMLogEntry -Value " - An error occurred while attempting to retrieve a list of available fallback driver packages from AdminService endpoint. Error message: $($_.Exception.Message)" -Severity 3
-				
-				# Throw terminating error				
-				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+				Write-Output "ApplyDriverPackage: FATAL - Fallback driver package retrieval failed: $($_.Exception.Message)"
+
+				# Throw terminating error
+				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Fallback driver package retrieval from AdminService failed: $($_.Exception.Message)"))
 			}
 		}
 		else {
@@ -1898,9 +1968,10 @@ Process {
 						}
 						else {
 							Write-CMLogEntry -Value " - Validation after fallback process failed with empty list of matched driver packages, script execution will be terminated" -Severity 3
-							
-							# Throw terminating error							
-							$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+							Write-Output "ApplyDriverPackage: FATAL - No driver package matched after OS version fallback for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
+
+							# Throw terminating error
+							$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No driver package matched after OS version fallback for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). Verify a driver package exists for this model."))
 						}
 					}
 				}
@@ -1910,9 +1981,10 @@ Process {
 					}
 					else {
 						Write-CMLogEntry -Value " - Validation failed with empty list of matched driver packages, script execution will be terminated" -Severity 3
-						
-						# Throw terminating error						
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+						Write-Output "ApplyDriverPackage: FATAL - No driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
+
+						# Throw terminating error
+						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). Verify a driver package exists for this model with the correct manufacturer, OS name, and architecture."))
 					}
 				}
 			}
@@ -1965,9 +2037,10 @@ Process {
 				0 {
 					Write-CMLogEntry -Value " - Amount of fallback driver packages detected by validation process: $($DriverPackageList.Count)" -Severity 3
 					Write-CMLogEntry -Value " - Validation failed with empty list of matched fallback driver packages, script execution will be terminated" -Severity 3
-					
-					# Throw terminating error					
-					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					Write-Output "ApplyDriverPackage: FATAL - No fallback driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). No regular or fallback packages found."
+
+					# Throw terminating error
+					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No fallback driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). Both regular and fallback package matching failed."))
 				}
 				1 {
 					Write-CMLogEntry -Value " - Amount of fallback driver packages detected by validation process: $($DriverPackageList.Count)" -Severity 1
@@ -2314,14 +2387,40 @@ Process {
 			$DriverPackageContentLocation = $TSEnvironment.Value("OSDDriverPackage01")
 			Write-CMLogEntry -Value " - Driver package content files was successfully downloaded to: $($DriverPackageContentLocation)" -Severity 1
 
+			# Log distribution point and content source information for boundary group troubleshooting
+			try {
+				$ContentLocationMP = $TSEnvironment.Value("_SMSTSMP")
+				if (-not([string]::IsNullOrEmpty($ContentLocationMP))) {
+					Write-CMLogEntry -Value " - Current Management Point: $($ContentLocationMP)" -Severity 1
+					Write-Output "ApplyDriverPackage: Management Point: $($ContentLocationMP)"
+				}
+				$LastContentDownloadLocation = $TSEnvironment.Value("_SMSTSLastContentDownloadLocation")
+				if (-not([string]::IsNullOrEmpty($LastContentDownloadLocation))) {
+					Write-CMLogEntry -Value " - Content downloaded from Distribution Point: $($LastContentDownloadLocation)" -Severity 1
+					Write-Output "ApplyDriverPackage: Distribution Point source: $($LastContentDownloadLocation)"
+				}
+				else {
+					# Parse DP from content location path (UNC paths typically contain the DP server name)
+					if ($DriverPackageContentLocation -match '\\\\([^\\]+)\\') {
+						Write-CMLogEntry -Value " - Content path suggests Distribution Point server: $($Matches[1])" -Severity 1
+						Write-Output "ApplyDriverPackage: Content path DP server: $($Matches[1])"
+					}
+				}
+			}
+			catch {
+				Write-CMLogEntry -Value " - Unable to determine Distribution Point information: $($_.Exception.Message)" -Severity 2
+			}
+			Write-Output "ApplyDriverPackage: Content downloaded to: $($DriverPackageContentLocation)"
+
 			# Handle return value for successful download of driver package content files
 			return $DriverPackageContentLocation
 		}
 		else {
 			Write-CMLogEntry -Value " - Driver package content download process returned an unhandled exit code: $($DownloadInvocation)" -Severity 3
+			Write-Output "ApplyDriverPackage: FATAL - Content download returned unhandled exit code: $($DownloadInvocation)"
 
 			# Throw terminating error
-			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Driver package content download returned unhandled exit code: $($DownloadInvocation). Check SMSTS.log for OSDDownloadContent.exe output."))
 		}
 	}
 	
@@ -2530,16 +2629,18 @@ Process {
 							}
 							else {
 								Write-CMLogEntry -Value " - An error occurred while enumerating driver paths, downloaded driver package does not contain any INF files" -Severity 3
-								
-								# Throw terminating error								
-								$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+								Write-Output "ApplyDriverPackage: FATAL - Downloaded driver package contains no INF files in: $($ContentLocation)"
+
+								# Throw terminating error
+								$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Downloaded driver package contains no INF files in: $($ContentLocation). Verify the driver package source has valid driver files."))
 							}
 						}
 						catch [System.Exception] {
 							Write-CMLogEntry -Value " - An error occurred while installing drivers. See DISM.log for more details" -Severity 2
-							
-							# Throw terminating error							
-							$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+							Write-Output "ApplyDriverPackage: FATAL - DISM driver injection failed: $($_.Exception.Message)"
+
+							# Throw terminating error
+							$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "DISM driver injection failed: $($_.Exception.Message). Check X:\Windows\Logs\DISM\dism.log for details."))
 						}
 					}
 					"Recurse" {
@@ -2661,13 +2762,20 @@ Process {
 		
 		# Determine computer manufacturer, model, SystemSKU and FallbackSKU
 		$ComputerData = Get-ComputerData
-		
+
+		# Output computer details to SMSTS.log for remote troubleshooting
+		Write-Output "ApplyDriverPackage: Manufacturer: $($ComputerData.Manufacturer)"
+		Write-Output "ApplyDriverPackage: Model: $($ComputerData.Model)"
+		Write-Output "ApplyDriverPackage: SystemSKU: $($ComputerData.SystemSKU)"
+		if (-not([string]::IsNullOrEmpty($ComputerData.FallbackSKU))) { Write-Output "ApplyDriverPackage: FallbackSKU: $($ComputerData.FallbackSKU)" }
+
 		# Validate required computer details have successfully been gathered from WMI
 		Test-ComputerDetails -InputObject $ComputerData
-		
+
 		# Determine the computer detection method to be used for matching against driver packages
 		$ComputerDetectionMethod = Set-ComputerDetectionMethod
-		
+		Write-Output "ApplyDriverPackage: Detection method: $($ComputerDetectionMethod)"
+
 		Write-CMLogEntry -Value "[PrerequisiteChecker]: Completed environment prerequisite checker" -Severity 1
 		
 		if ($Script:PSCmdLet.ParameterSetName -notlike "XMLPackage") {
@@ -2698,22 +2806,25 @@ Process {
 		
 		# Retrieve available driver packages from web service
 		$DriverPackages = Get-DriverPackages
-		
+		Write-Output "ApplyDriverPackage: Retrieved $(($DriverPackages | Measure-Object).Count) driver packages from AdminService"
+
 		# Determine the OS image version and architecture values based upon parameter input
 		$OSImageDetails = Get-OSImageDetails
-		
+		Write-Output "ApplyDriverPackage: OS target - Name: $($OSImageDetails.Name), Version: $($OSImageDetails.Version), Architecture: $($OSImageDetails.Architecture)"
+
 		Write-CMLogEntry -Value "[DriverPackage]: Starting driver package matching phase" -Severity 1
-		
+
 		# Match detected driver packages from web service call with computer details and OS image details gathered previously
 		Confirm-DriverPackage -ComputerData $ComputerData -OSImageData $OSImageDetails -DriverPackage $DriverPackages
-		
+
 		Write-CMLogEntry -Value "[DriverPackage]: Completed driver package matching phase" -Severity 1
 		Write-CMLogEntry -Value "[DriverPackageValidation]: Starting driver package validation phase" -Severity 1
-		
+		Write-Output "ApplyDriverPackage: Matched $($DriverPackageList.Count) driver package(s) after filtering"
+
 		# Validate that at least one driver package was matched against computer data
 		# Check if multiple driver packages were detected and ensure the most recent one by sorting after the DateCreated property from original AdminService call
 		Confirm-DriverPackageList
-		
+
 		Write-CMLogEntry -Value "[DriverPackageValidation]: Completed driver package validation phase" -Severity 1
 		
 		# Handle UseDriverFallback parameter if it was passed on the command line and attempt to detect if there's any available fallback packages
@@ -2733,6 +2844,14 @@ Process {
 			Write-CMLogEntry -Value "[DriverPackageFallbackValidation]: Completed fallback driver package validation phase" -Severity 1
 		}
 		
+		# Output final matched package to SMSTS.log
+		if ($DriverPackageList.Count -ge 1) {
+			Write-Output "ApplyDriverPackage: MATCHED package '$($DriverPackageList[0].PackageName)' (ID: $($DriverPackageList[0].PackageID), Version: $($DriverPackageList[0].PackageVersion))"
+		}
+		else {
+			Write-Output "ApplyDriverPackage: WARNING - No driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
+		}
+
 		# At this point, the code below here is not allowed to be executed in debug mode
 		if ($PSCmdLet.ParameterSetName -notlike "Debug") {
 			# For DriverUpdate deployments, check if the matched driver package is already installed and up-to-date
@@ -2776,6 +2895,18 @@ Process {
 
 			if (-not $SkipDriverUpdate) {
 				Write-CMLogEntry -Value "[DriverPackageDownload]: Starting driver package download phase" -Severity 1
+
+				# Log current Management Point for boundary group troubleshooting
+				try {
+					$CurrentMP = $TSEnvironment.Value("_SMSTSMP")
+					if (-not([string]::IsNullOrEmpty($CurrentMP))) {
+						Write-CMLogEntry -Value " - Current Management Point in use: $($CurrentMP)" -Severity 1
+						Write-Output "ApplyDriverPackage: Management Point (pre-download): $($CurrentMP)"
+					}
+				}
+				catch {
+					# Non-fatal - MP variable may not be available in all scenarios
+				}
 
 				# Attempt to download the matched driver package content files from distribution point
 				$DriverPackageContentLocation = Invoke-DownloadDriverPackageContent
@@ -2822,7 +2953,10 @@ Process {
 
 		# Main try-catch block warning message
 		Write-CMLogEntry -Value "[ApplyDriverPackage]: Apply Driver Package process failed, please refer to previous error or warning messages" -Severity 3
-		
+
+		# Output error to SMSTS.log for remote troubleshooting
+		Write-Output "ApplyDriverPackage: FAILED - $($Error[0].Exception.Message)"
+
 		# Main try-catch block was triggered, this should cause the script to fail with exit code 1
 		exit 1
 	}
