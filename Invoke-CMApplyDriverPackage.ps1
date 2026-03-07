@@ -642,7 +642,7 @@ Process {
 			}
 			else {
 				Write-CMLogEntry -Value " - Failed to download package content with PackageID '$($PackageID)'. Return code was: $($ReturnCode)" -Severity 3
-				Write-Output "ApplyDriverPackage: FATAL - Package content download failed for PackageID '$($PackageID)' with return code $($ReturnCode)"
+				Write-Host "ApplyDriverPackage: FATAL - Package content download failed for PackageID '$($PackageID)' with return code $($ReturnCode)"
 
 				# Throw terminating error
 				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Package content download failed for PackageID '$($PackageID)' with return code $($ReturnCode). Verify package content is distributed to a DP accessible from WinPE."))
@@ -650,7 +650,7 @@ Process {
 		}
 		catch [System.Exception] {
 			Write-CMLogEntry -Value " - An error occurred while attempting to download package content. Error message: $($_.Exception.Message)" -Severity 3
-			Write-Output "ApplyDriverPackage: FATAL - Package content download error: $($_.Exception.Message)"
+			Write-Host "ApplyDriverPackage: FATAL - Package content download error: $($_.Exception.Message)"
 
 			# Throw terminating error
 			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Package content download error: $($_.Exception.Message)"))
@@ -774,7 +774,7 @@ Process {
 					}
 					else {
 						Write-CMLogEntry -Value " - Required service account user name could not be determined from TS environment variable" -Severity 3
-						Write-Output "ApplyDriverPackage: FATAL - MDMUserName TS variable is empty or not set"
+						Write-Host "ApplyDriverPackage: FATAL - MDMUserName TS variable is empty or not set"
 
 						# Throw terminating error
 						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "MDMUserName TS variable is empty or not set. Create a Set Task Sequence Variable step before this step to set MDMUserName."))
@@ -803,7 +803,7 @@ Process {
 					}
 					else {
 						Write-CMLogEntry -Value " - Required service account password could not be determined from TS environment variable" -Severity 3
-						Write-Output "ApplyDriverPackage: FATAL - MDMPassword TS variable is empty or not set"
+						Write-Host "ApplyDriverPackage: FATAL - MDMPassword TS variable is empty or not set"
 
 						# Throw terminating error
 						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "MDMPassword TS variable is empty or not set. Create a Set Task Sequence Variable step before this step to set MDMPassword."))
@@ -877,7 +877,7 @@ Process {
 				}
 				else {
 					Write-CMLogEntry -Value " - Detected that script was not running in WinPE of a bare metal deployment type, this is not a supported scenario" -Severity 3
-					Write-Output "ApplyDriverPackage: FATAL - BareMetal mode requires WinPE but _SMSTSInWinPE is not true"
+					Write-Host "ApplyDriverPackage: FATAL - BareMetal mode requires WinPE but _SMSTSInWinPE is not true"
 
 					# Throw terminating error
 					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "BareMetal deployment type requires script to run in WinPE phase. Ensure the Apply Driver Package step runs before the Setup Windows and ConfigMgr step."))
@@ -1020,7 +1020,7 @@ Process {
 				}
 				catch [System.Exception] {
 					Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint. Error message: $($PSItem.Exception.Message)" -Severity 3
-					Write-Output "ApplyDriverPackage: FATAL - AdminService external endpoint connection failed: $($PSItem.Exception.Message)"
+					Write-Host "ApplyDriverPackage: FATAL - AdminService external endpoint connection failed: $($PSItem.Exception.Message)"
 
 					# Throw terminating error
 					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "AdminService external endpoint connection failed: $($PSItem.Exception.Message)"))
@@ -1049,7 +1049,7 @@ Process {
 					}
 					catch [System.Exception] {
 						Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint. Error message: $($PSItem.Exception.Message)" -Severity 3
-						Write-Output "ApplyDriverPackage: FATAL - AdminService connection failed after certificate bypass retry: $($PSItem.Exception.Message)"
+						Write-Host "ApplyDriverPackage: FATAL - AdminService connection failed after certificate bypass retry: $($PSItem.Exception.Message)"
 
 						# Throw terminating error
 						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "AdminService connection failed after certificate bypass retry: $($PSItem.Exception.Message)"))
@@ -1057,7 +1057,7 @@ Process {
 				}
 				catch {
 					Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint. Error message: $($PSItem.Exception.Message)" -Severity 3
-					Write-Output "ApplyDriverPackage: FATAL - AdminService connection to $($AdminServiceUri) failed: $($PSItem.Exception.Message)"
+					Write-Host "ApplyDriverPackage: FATAL - AdminService connection to $($AdminServiceUri) failed: $($PSItem.Exception.Message)"
 
 					# Throw terminating error
 					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "AdminService connection to $($AdminServiceUri) failed: $($PSItem.Exception.Message)"))
@@ -1266,7 +1266,7 @@ Process {
 			}
 			else {
 				Write-CMLogEntry -Value " - Retrieved a total of '0' driver packages from $($Script:PackageSource) matching operational mode: $($OperationalMode)" -Severity 3
-				Write-Output "ApplyDriverPackage: FATAL - No driver packages found in AdminService matching filter '$($Filter)' and operational mode '$($OperationalMode)'"
+				Write-Host "ApplyDriverPackage: FATAL - No driver packages found in AdminService matching filter '$($Filter)' and operational mode '$($OperationalMode)'"
 
 				# Throw terminating error
 				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No driver packages found in AdminService matching filter '$($Filter)' and operational mode '$($OperationalMode)'. Verify packages exist with '$($Filter)' in the name."))
@@ -1411,7 +1411,7 @@ Process {
 		
 		if (($ComputerDetection.ModelDetected -eq $false) -and ($ComputerDetection.SystemSKUDetected -eq $false)) {
 			Write-CMLogEntry -Value " - Computer model and SystemSKU values are missing, script execution is not allowed since required values to continue could not be gathered" -Severity 3
-			Write-Output "ApplyDriverPackage: FATAL - Both computer Model and SystemSKU are null/empty. Cannot match driver packages."
+			Write-Host "ApplyDriverPackage: FATAL - Both computer Model and SystemSKU are null/empty. Cannot match driver packages."
 
 			# Throw terminating error
 			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Both computer Model and SystemSKU are null or empty. WMI query returned no usable values for driver package matching."))
@@ -1699,7 +1699,7 @@ Process {
 				}
 				else {
 					Write-CMLogEntry -Value " - Retrieved a total of '0' fallback driver packages from AdminService matching operational mode: $($OperationalMode)" -Severity 3
-					Write-Output "ApplyDriverPackage: FATAL - No fallback driver packages found with 'Driver Fallback Package' in the name"
+					Write-Host "ApplyDriverPackage: FATAL - No fallback driver packages found with 'Driver Fallback Package' in the name"
 
 					# Throw terminating error
 					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No fallback driver packages found. Create a package named 'Driver Fallback Package' with the appropriate manufacturer, OS, and architecture for $($ComputerData.Manufacturer)."))
@@ -1707,7 +1707,7 @@ Process {
 			}
 			catch [System.Exception] {
 				Write-CMLogEntry -Value " - An error occurred while attempting to retrieve a list of available fallback driver packages from AdminService endpoint. Error message: $($_.Exception.Message)" -Severity 3
-				Write-Output "ApplyDriverPackage: FATAL - Fallback driver package retrieval failed: $($_.Exception.Message)"
+				Write-Host "ApplyDriverPackage: FATAL - Fallback driver package retrieval failed: $($_.Exception.Message)"
 
 				# Throw terminating error
 				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Fallback driver package retrieval from AdminService failed: $($_.Exception.Message)"))
@@ -1968,7 +1968,7 @@ Process {
 						}
 						else {
 							Write-CMLogEntry -Value " - Validation after fallback process failed with empty list of matched driver packages, script execution will be terminated" -Severity 3
-							Write-Output "ApplyDriverPackage: FATAL - No driver package matched after OS version fallback for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
+							Write-Host "ApplyDriverPackage: FATAL - No driver package matched after OS version fallback for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
 
 							# Throw terminating error
 							$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No driver package matched after OS version fallback for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). Verify a driver package exists for this model."))
@@ -1981,7 +1981,7 @@ Process {
 					}
 					else {
 						Write-CMLogEntry -Value " - Validation failed with empty list of matched driver packages, script execution will be terminated" -Severity 3
-						Write-Output "ApplyDriverPackage: FATAL - No driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
+						Write-Host "ApplyDriverPackage: FATAL - No driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
 
 						# Throw terminating error
 						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). Verify a driver package exists for this model with the correct manufacturer, OS name, and architecture."))
@@ -2037,7 +2037,7 @@ Process {
 				0 {
 					Write-CMLogEntry -Value " - Amount of fallback driver packages detected by validation process: $($DriverPackageList.Count)" -Severity 3
 					Write-CMLogEntry -Value " - Validation failed with empty list of matched fallback driver packages, script execution will be terminated" -Severity 3
-					Write-Output "ApplyDriverPackage: FATAL - No fallback driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). No regular or fallback packages found."
+					Write-Host "ApplyDriverPackage: FATAL - No fallback driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). No regular or fallback packages found."
 
 					# Throw terminating error
 					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "No fallback driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU)). Both regular and fallback package matching failed."))
@@ -2388,36 +2388,37 @@ Process {
 			Write-CMLogEntry -Value " - Driver package content files was successfully downloaded to: $($DriverPackageContentLocation)" -Severity 1
 
 			# Log distribution point and content source information for boundary group troubleshooting
+			# NOTE: Write-Host is used here instead of Write-Output to avoid polluting the function return pipeline
 			try {
 				$ContentLocationMP = $TSEnvironment.Value("_SMSTSMP")
 				if (-not([string]::IsNullOrEmpty($ContentLocationMP))) {
 					Write-CMLogEntry -Value " - Current Management Point: $($ContentLocationMP)" -Severity 1
-					Write-Output "ApplyDriverPackage: Management Point: $($ContentLocationMP)"
+					Write-Host "ApplyDriverPackage: Management Point: $($ContentLocationMP)"
 				}
 				$LastContentDownloadLocation = $TSEnvironment.Value("_SMSTSLastContentDownloadLocation")
 				if (-not([string]::IsNullOrEmpty($LastContentDownloadLocation))) {
 					Write-CMLogEntry -Value " - Content downloaded from Distribution Point: $($LastContentDownloadLocation)" -Severity 1
-					Write-Output "ApplyDriverPackage: Distribution Point source: $($LastContentDownloadLocation)"
+					Write-Host "ApplyDriverPackage: Distribution Point source: $($LastContentDownloadLocation)"
 				}
 				else {
 					# Parse DP from content location path (UNC paths typically contain the DP server name)
 					if ($DriverPackageContentLocation -match '\\\\([^\\]+)\\') {
 						Write-CMLogEntry -Value " - Content path suggests Distribution Point server: $($Matches[1])" -Severity 1
-						Write-Output "ApplyDriverPackage: Content path DP server: $($Matches[1])"
+						Write-Host "ApplyDriverPackage: Content path DP server: $($Matches[1])"
 					}
 				}
 			}
 			catch {
 				Write-CMLogEntry -Value " - Unable to determine Distribution Point information: $($_.Exception.Message)" -Severity 2
 			}
-			Write-Output "ApplyDriverPackage: Content downloaded to: $($DriverPackageContentLocation)"
+			Write-Host "ApplyDriverPackage: Content downloaded to: $($DriverPackageContentLocation)"
 
 			# Handle return value for successful download of driver package content files
 			return $DriverPackageContentLocation
 		}
 		else {
 			Write-CMLogEntry -Value " - Driver package content download process returned an unhandled exit code: $($DownloadInvocation)" -Severity 3
-			Write-Output "ApplyDriverPackage: FATAL - Content download returned unhandled exit code: $($DownloadInvocation)"
+			Write-Host "ApplyDriverPackage: FATAL - Content download returned unhandled exit code: $($DownloadInvocation)"
 
 			# Throw terminating error
 			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Driver package content download returned unhandled exit code: $($DownloadInvocation). Check SMSTS.log for OSDDownloadContent.exe output."))
@@ -2629,7 +2630,7 @@ Process {
 							}
 							else {
 								Write-CMLogEntry -Value " - An error occurred while enumerating driver paths, downloaded driver package does not contain any INF files" -Severity 3
-								Write-Output "ApplyDriverPackage: FATAL - Downloaded driver package contains no INF files in: $($ContentLocation)"
+								Write-Host "ApplyDriverPackage: FATAL - Downloaded driver package contains no INF files in: $($ContentLocation)"
 
 								# Throw terminating error
 								$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Downloaded driver package contains no INF files in: $($ContentLocation). Verify the driver package source has valid driver files."))
@@ -2637,7 +2638,7 @@ Process {
 						}
 						catch [System.Exception] {
 							Write-CMLogEntry -Value " - An error occurred while installing drivers. See DISM.log for more details" -Severity 2
-							Write-Output "ApplyDriverPackage: FATAL - DISM driver injection failed: $($_.Exception.Message)"
+							Write-Host "ApplyDriverPackage: FATAL - DISM driver injection failed: $($_.Exception.Message)"
 
 							# Throw terminating error
 							$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "DISM driver injection failed: $($_.Exception.Message). Check X:\Windows\Logs\DISM\dism.log for details."))
@@ -2901,7 +2902,7 @@ Process {
 					$CurrentMP = $TSEnvironment.Value("_SMSTSMP")
 					if (-not([string]::IsNullOrEmpty($CurrentMP))) {
 						Write-CMLogEntry -Value " - Current Management Point in use: $($CurrentMP)" -Severity 1
-						Write-Output "ApplyDriverPackage: Management Point (pre-download): $($CurrentMP)"
+						Write-Host "ApplyDriverPackage: Management Point (pre-download): $($CurrentMP)"
 					}
 				}
 				catch {
