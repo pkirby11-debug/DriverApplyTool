@@ -1738,8 +1738,8 @@ Process {
 			$DriverPackageInputConversion = $DriverPackageInput.Replace("H1", "05").Replace("H2", 10)
 			$OSImageDataVersionConversion = $OSImageData.Version.Replace("H1", "05").Replace("H2", 10)
 
-			if ([int]$DriverPackageInputConversion -lt [int]$OSImageDataVersionConversion) {
-				# OS version match found where driver package input was less than input from OSImageData version
+			if ([int]$DriverPackageInputConversion -ne [int]$OSImageDataVersionConversion) {
+				# OS version match found where driver package input differs from OSImageData version (accepts both older and newer)
 				Write-CMLogEntry -Value " - Matched operating system version: $($DriverPackageInput)" -Severity 1
 				return $true
 			}
