@@ -280,6 +280,12 @@
 						 - Added early diagnostic output in Begin block before TSEnvironment initialization
 						 - TSEnvironment COM object failure now outputs error details and exits with code 1 instead of code 0
 						 - Removed Win32_BaseBoard CIM query (no longer needed without removed manufacturers)
+	5.4.0 - (2026-04-07) - ValidationMode for safe end-to-end testing on virtual machines:
+						 - Added -ValidationMode switch: runs prerequisite checks, AdminService connectivity, package retrieval, and matching without downloading or applying drivers
+						 - ValidationMode allows execution on Hyper-V/VMware/VirtualBox VMs that would normally be blocked by the platform check
+						 - Added -MockManufacturer, -MockModel, -MockSystemSKU parameters to simulate a real device for end-to-end matching tests on a VM
+						 - ValidationMode exits cleanly with code 0 on success so the TS step reports success when validation passes
+						 - Confirm-DriverPackageList no longer throws on empty match list when ValidationMode is set
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -413,6 +419,22 @@ param(
 	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
 	[switch]$ForceUpdate,
 
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Run the script in validation mode. Exercises prerequisite checks, AdminService connectivity, package retrieval, and (optionally) package matching, but does not download or apply any drivers. Allows execution on virtual machines for end-to-end testing of the script during a TS run. Exits with code 0 on success.")]
+	[switch]$ValidationMode,
+
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "When used with -ValidationMode, override the detected manufacturer to simulate a real device for package matching tests.")]
+	[ValidateNotNullOrEmpty()]
+	[ValidateSet("Dell", "Lenovo", "Microsoft")]
+	[string]$MockManufacturer,
+
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "When used with -ValidationMode, override the detected model to simulate a real device for package matching tests.")]
+	[ValidateNotNullOrEmpty()]
+	[string]$MockModel,
+
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "When used with -ValidationMode, override the detected SystemSKU to simulate a real device for package matching tests.")]
+	[ValidateNotNullOrEmpty()]
+	[string]$MockSystemSKU,
+
 	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Specify a UNC path to write a duplicate log file for remote troubleshooting, e.g. '\\\\server\\share\\OSDLogs'.")]
 	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
 	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
@@ -424,7 +446,7 @@ param(
 )
 Begin {
 	# Script version for logging and troubleshooting
-	$ScriptVersion = "5.3.1"
+	$ScriptVersion = "5.4.0"
 
 	# Early diagnostic output to SMSTS.log (Write-Output appears in TS logs even if script logging isn't initialized)
 	Write-Output "ApplyDriverPackage: Script version $($ScriptVersion) starting"
@@ -1332,6 +1354,23 @@ Process {
 				$ComputerDetails.SystemSKU = $SystemSKU
 			}
 		}
+
+		# Handle overriding computer details if validation mode and mock parameters were specified
+		if ($Script:ValidationMode.IsPresent) {
+			if (-not([string]::IsNullOrEmpty($MockManufacturer))) {
+				Write-CMLogEntry -Value " - [ValidationMode] Overriding manufacturer with mock value: $($MockManufacturer)" -Severity 2
+				$ComputerDetails.Manufacturer = $MockManufacturer
+			}
+			if (-not([string]::IsNullOrEmpty($MockModel))) {
+				Write-CMLogEntry -Value " - [ValidationMode] Overriding model with mock value: $($MockModel)" -Severity 2
+				$ComputerDetails.Model = $MockModel
+			}
+			if (-not([string]::IsNullOrEmpty($MockSystemSKU))) {
+				Write-CMLogEntry -Value " - [ValidationMode] Overriding SystemSKU with mock value: $($MockSystemSKU)" -Severity 2
+				$ComputerDetails.SystemSKU = $MockSystemSKU
+				$ComputerDetails.FallbackSKU = $MockSystemSKU
+			}
+		}
 		
 		# Handle output to log file for computer details
 		Write-CMLogEntry -Value " - Computer manufacturer determined as: $($ComputerDetails.Manufacturer)" -Severity 1
@@ -1363,10 +1402,13 @@ Process {
 			if ($Script:PSCmdlet.ParameterSetName -like "Debug") {
 				Write-CMLogEntry -Value " - Unsupported computer platform detected, virtual machines are not supported but will be allowed in DebugMode" -Severity 2
 			}
+			elseif ($Script:ValidationMode.IsPresent) {
+				Write-CMLogEntry -Value " - Unsupported computer platform detected, virtual machines are not supported but will be allowed in ValidationMode" -Severity 2
+			}
 			else {
 				Write-CMLogEntry -Value " - Unsupported computer platform detected, virtual machines are not supported" -Severity 3
-				
-				# Throw terminating error				
+
+				# Throw terminating error
 				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
 			}
 		}
@@ -1945,7 +1987,12 @@ Process {
 		switch ($DriverPackageList.Count) {
 			0 {
 				Write-CMLogEntry -Value " - Amount of driver packages detected by validation process: $($DriverPackageList.Count)" -Severity 2
-				
+
+				if ($Script:ValidationMode.IsPresent) {
+					Write-CMLogEntry -Value " - [ValidationMode] No matching driver package was found. This is informational only and will not terminate validation." -Severity 2
+					return
+				}
+
 				if ($Script:PSBoundParameters["OSVersionFallback"]) {
 					Write-CMLogEntry -Value " - Validation process detected empty list of matched driver packages, however OSVersionFallback switch was passed on the command line" -Severity 2
 					Write-CMLogEntry -Value " - Starting re-matching process of driver packages for older Windows versions" -Severity 1
@@ -2851,6 +2898,26 @@ Process {
 		}
 		else {
 			Write-Output "ApplyDriverPackage: WARNING - No driver package matched for $($ComputerData.Manufacturer) $($ComputerData.Model) (SKU: $($ComputerData.SystemSKU))"
+		}
+
+		# ValidationMode early exit - skip download/install entirely. This lets us run the script
+		# end-to-end against the AdminService from any device (including Hyper-V VMs) to confirm
+		# that prerequisites, credentials, connectivity, and package retrieval are all healthy
+		# without touching the OS.
+		if ($Script:ValidationMode.IsPresent) {
+			Write-CMLogEntry -Value "[ValidationMode]: ====================================================" -Severity 1
+			Write-CMLogEntry -Value "[ValidationMode]: VALIDATION PASSED" -Severity 1
+			Write-CMLogEntry -Value "[ValidationMode]:   - AdminService URL: $($Script:AdminServiceURL)" -Severity 1
+			Write-CMLogEntry -Value "[ValidationMode]:   - Driver packages retrieved: $(($DriverPackages | Measure-Object).Count)" -Severity 1
+			Write-CMLogEntry -Value "[ValidationMode]:   - Mock device used: $(if ($MockManufacturer -or $MockModel -or $MockSystemSKU) { "Yes ($($ComputerData.Manufacturer) / $($ComputerData.Model) / SKU $($ComputerData.SystemSKU))" } else { "No (real device data)" })" -Severity 1
+			Write-CMLogEntry -Value "[ValidationMode]:   - Driver packages matched: $($DriverPackageList.Count)" -Severity 1
+			if ($DriverPackageList.Count -ge 1) {
+				Write-CMLogEntry -Value "[ValidationMode]:   - Matched package: $($DriverPackageList[0].PackageName) (ID: $($DriverPackageList[0].PackageID))" -Severity 1
+			}
+			Write-CMLogEntry -Value "[ValidationMode]: Skipping download and installation phases - exiting with code 0" -Severity 1
+			Write-CMLogEntry -Value "[ValidationMode]: ====================================================" -Severity 1
+			Write-Output "ApplyDriverPackage: VALIDATION PASSED - exiting cleanly without applying drivers"
+			exit 0
 		}
 
 		# At this point, the code below here is not allowed to be executed in debug mode
