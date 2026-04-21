@@ -38,7 +38,7 @@ These tell the script what driver package to look for.
 | Parameter | Required | Allowed Values | Description |
 |---|---|---|---|
 | `-TargetOSName <name>` | Yes | `Windows 11`, `Windows 10` | Which OS family this build is for. |
-| `-TargetOSVersion <ver>` | Yes (most modes) | `24H2`, `23H2`, `22H2`, `2004`, etc. | Feature update version. Pattern enforced: must be `##H#` or 4 digits. |
+| `-TargetOSVersion <ver>` | Yes (most modes) | `25H2`, `24H2`, `23H2`, `22H2`, `2004`, etc. | Feature update version. Pattern enforced: must be `##H#` or 4 digits. |
 | `-TargetOSArchitecture <arch>` | No (default `x64`) | `x64`, `x86` | Architecture. Always `x64` for us. |
 
 ---
