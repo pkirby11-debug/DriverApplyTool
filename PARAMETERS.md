@@ -1,6 +1,6 @@
 # Invoke-CMApplyDriverPackage.ps1 — Parameter Reference
 
-Reference guide for `Invoke-CMApplyDriverPackage.ps1` (v5.4.0). Covers every parameter, what it does, and when to use it.
+Reference guide for `Invoke-CMApplyDriverPackage.ps1` (v5.5.0). Covers every parameter, what it does, and when to use it.
 
 ---
 
@@ -137,6 +137,38 @@ For dry-run testing the script during a TS on a Hyper-V VM **without** downloadi
 ### Local Debug test on a tech workstation
 ```powershell
 .\Invoke-CMApplyDriverPackage.ps1 -DebugMode -Endpoint CHMCSCCM.methodistcol.corp -UserName "METHODISTCOL\svc.MECM.ReadOnlyAna" -Password "P@ssw0rd" -TargetOSName "Windows 11" -TargetOSVersion 24H2 -Manufacturer Dell -ComputerModel "Dell Pro 14 Plus PB14250" -SystemSKU 0CDC
+```
+
+---
+
+# Microsoft Surface Pro 12th Edition with Intel
+
+Added in v5.5.0. The device is matched by **SystemSKU** (read from `MS_SystemInformation`). Driver content is the Microsoft Surface MSI, which the script extracts automatically during apply.
+
+| Identifier | Value |
+|---|---|
+| Manufacturer | `Microsoft` |
+| System Model | `Surface Pro for Business 13in 12th Ed Intel` |
+| SystemSKU (outside Korea) | `Surface_Pro_for_Business_13in_12th_Ed_Intel_2103` |
+| SystemSKU (Korea) | `Surface_Pro_for_Business_13in_12th_Ed_Intel_2134` |
+| SystemSKU (5G, outside Japan/Korea) | `Surface_Pro_5G_for_Business_13in_12th_Ed_Intel_2077` |
+| SystemSKU (5G, Korea) | `Surface_Pro_5G_for_Business_13in_12th_Ed_Intel_2132` |
+| Architecture | `x64` |
+
+> **Package setup:** the SCCM driver package's **Description** must contain the SystemSKU(s) above (comma-separated if you cover multiple regions/5G) — that's what the script matches on. The package **Name** should follow the DAT convention, e.g. `Drivers - Microsoft Surface Pro for Business 13in 12th Ed Intel - Windows 11 24H2 x64`.
+>
+> **Why the full SKU matters:** some numeric suffixes are shared across devices (e.g. `2077` and `2103` also appear on Surface Pro 10/11 SKUs), so the script matches the **entire** SystemSKU string, not just the number. Keep the full `Surface_Pro_..._Intel_####` value in the package Description.
+>
+> This is the **Surface Pro 12th Edition with Intel** (13-inch, x64). It is a different device from the **Surface Pro 12-inch 1st Edition**, which is Snapdragon/ARM64 only and is not covered here.
+
+### Validate the match on a VM (no download or apply)
+```
+-BareMetal -Endpoint CHMCSCCM.methodistcol.corp -TargetOSName "Windows 11" -TargetOSVersion 24H2 -ValidationMode -MockManufacturer Microsoft -MockSystemSKU Surface_Pro_for_Business_13in_12th_Ed_Intel_2103
+```
+
+### Local Debug test on a tech workstation (Surface Pro 12th Ed Intel)
+```powershell
+.\Invoke-CMApplyDriverPackage.ps1 -DebugMode -Endpoint CHMCSCCM.methodistcol.corp -UserName "METHODISTCOL\svc.MECM.ReadOnlyAna" -Password "P@ssw0rd" -TargetOSName "Windows 11" -TargetOSVersion 24H2 -Manufacturer Microsoft -ComputerModel "Surface Pro for Business 13in 12th Ed Intel" -SystemSKU Surface_Pro_for_Business_13in_12th_Ed_Intel_2103
 ```
 
 ---
