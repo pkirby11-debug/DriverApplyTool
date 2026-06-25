@@ -301,6 +301,9 @@
 						   null, preventing a parameter validation error when a Surface package name does not split as expected
 						 - Architecture detection now also recognizes the arm64 token so Surface Pro 12 Snapdragon sibling packages are
 						   cleanly identified and skipped for an x64 (Intel) target instead of producing a null architecture
+						 - Firmware update INFs (e.g. Microsoft Surface firmware components, Class=Firmware) are now detected and
+						   skipped during driver injection in all apply modes (BareMetal DISM Single/Recurse and DriverUpdate
+						   pnputil), preventing the driver-apply errors these firmware INFs previously caused
 						 - Trimmed the Microsoft SystemSKU read from MS_SystemInformation and guarded against a null value
 						 - Added DebugMode and ValidationMode examples for the Surface Pro 12th Edition with Intel
 #>
@@ -2523,6 +2526,33 @@ Process {
 		}
 	}
 	
+	function Test-FirmwareDriverInf {
+		param (
+			[parameter(Mandatory = $true, HelpMessage = "Specify the full path to the driver INF file to inspect.")]
+			[ValidateNotNullOrEmpty()]
+			[string]$Path
+		)
+		# Surface driver/firmware packages include firmware update components whose INF files declare the Firmware
+		# setup class (Class=Firmware / ClassGuid {f2e7dd72-6468-4e36-b6f1-6488f42c1b52}). These cannot be injected
+		# into an offline image with DISM /Add-Driver and previously caused driver application to error out, so they
+		# must be skipped. Returns $true when the INF is a firmware update package.
+		try {
+			$InfContent = Get-Content -Path $Path -Raw -ErrorAction Stop
+			if ($InfContent -match "(?im)^\s*Class\s*=\s*Firmware\b") {
+				return $true
+			}
+			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") {
+				return $true
+			}
+			return $false
+		}
+		catch [System.Exception] {
+			# If the INF cannot be read, do not treat it as firmware so normal injection still attempts it
+			Write-CMLogEntry -Value " - WARNING: Unable to read INF for firmware classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
+			return $false
+		}
+	}
+
 	function Install-DriverPackageContent {
 		param (
 			[parameter(Mandatory = $true, HelpMessage = "Specify the full local path to the downloaded driver package content.")]
@@ -2698,6 +2728,31 @@ Process {
 			}
 		}
 		
+		# Skip firmware update INFs (e.g. Microsoft Surface firmware components) before applying drivers. These declare
+		# the Firmware setup class and cannot be injected into an offline image with DISM /Add-Driver, and would also be
+		# picked up by pnputil during DriverUpdate. Renaming them out of the "*.inf" pattern excludes them from every
+		# injection method (DISM /Recurse, per-INF DISM, and pnputil /subdirs) without deleting any content.
+		try {
+			$ContentINFs = Get-ChildItem -Path $ContentLocation -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue
+			$FirmwareINFCount = 0
+			foreach ($ContentINF in $ContentINFs) {
+				if (Test-FirmwareDriverInf -Path $ContentINF.FullName) {
+					Write-CMLogEntry -Value " - Skipping firmware INF (excluded from driver injection): $($ContentINF.FullName)" -Severity 1
+					Rename-Item -Path $ContentINF.FullName -NewName "$($ContentINF.Name).firmware_skipped" -Force -ErrorAction Stop
+					$FirmwareINFCount++
+				}
+			}
+			if ($FirmwareINFCount -gt 0) {
+				Write-CMLogEntry -Value " - Excluded $($FirmwareINFCount) firmware INF file(s) from driver injection" -Severity 1
+			}
+			else {
+				Write-CMLogEntry -Value " - No firmware INF files detected in driver package content" -Severity 1
+			}
+		}
+		catch [System.Exception] {
+			Write-CMLogEntry -Value " - WARNING: An error occurred while excluding firmware INF files. Error message: $($_.Exception.Message)" -Severity 2
+		}
+
 		switch ($Script:DeploymentMode) {
 			"BareMetal" {
 				# Apply drivers recursively from downloaded driver package location

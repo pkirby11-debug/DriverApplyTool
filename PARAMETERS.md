@@ -145,6 +145,8 @@ For dry-run testing the script during a TS on a Hyper-V VM **without** downloadi
 
 Added in v5.5.0. The device is matched by **SystemSKU** (read from `MS_SystemInformation`). Driver content is the Microsoft Surface MSI, which the script extracts automatically during apply.
 
+> **Firmware files are skipped automatically.** The Surface MSI contains firmware update components (INFs with `Class=Firmware`) alongside the real device drivers. Those firmware INFs cannot be injected into an offline image and previously caused the apply step to error out. As of v5.5.0 the script detects them and excludes them from injection in every apply mode (BareMetal DISM and DriverUpdate pnputil), so only the actual hardware drivers are applied. The exclusions are logged to `ApplyDriverPackage.log` as `Skipping firmware INF ...`.
+
 | Identifier | Value |
 |---|---|
 | Manufacturer | `Microsoft` |
