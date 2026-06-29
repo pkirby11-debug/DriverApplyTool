@@ -1572,6 +1572,10 @@ Process {
 				}
 			}
 
+			# Diagnostic: log the SystemSKU parsed from the package description alongside the raw description so SystemSKU
+			# match failures can be diagnosed directly from the log without guesswork.
+			Write-CMLogEntry -Value "[DriverPackage:$($DriverPackageDetails.PackageID)]: Parsed SystemSKU '$($DriverPackageDetails.SystemSKU)' from package description '$($DriverPackageItem.Description)'" -Severity 1
+
 			# Add driver package model details depending on manufacturer to custom driver package details object
 			# - Microsoft Surface packages from DAT may include "Microsoft" in the model name (e.g. "Microsoft Surface Pro 9") or just "Surface Pro 9"
 			try {
@@ -2000,10 +2004,12 @@ Process {
 			}
 			else {
 				# SystemSKU match was not found based upon multiple items detected in computer data input
+				Write-CMLogEntry -Value " - Could not match SystemSKU (multi-value). Computer SystemSKU: '$($ComputerData.SystemSKU)' | Driver package SystemSKU input: '$($DriverPackageInput)'" -Severity 2
+
 				# Set properties for custom object for return value
 				$SystemSKUDetectionResult.SystemSKUValue = ""
 				$SystemSKUDetectionResult.Detected = $false
-				
+
 				return $SystemSKUDetectionResult
 			}
 		}
@@ -2029,10 +2035,12 @@ Process {
 		}
 		else {
 			# None of the above methods worked to match SystemSKU from driver package input with computer data input
+			Write-CMLogEntry -Value " - Could not match SystemSKU. Computer SystemSKU: '$($ComputerData.SystemSKU)' | Driver package SystemSKU input: '$($DriverPackageInput)'" -Severity 2
+
 			# Set properties for custom object for return value
 			$SystemSKUDetectionResult.SystemSKUValue = ""
 			$SystemSKUDetectionResult.Detected = $false
-			
+
 			return $SystemSKUDetectionResult
 		}
 	}
