@@ -1640,7 +1640,17 @@ Process {
 					else {
 						# Attempt to match against SystemSKU
 						$ComputerDetectionMethodResult = Confirm-SystemSKU -DriverPackageInput $DriverPackageDetails.SystemSKU -ComputerData $ComputerData -ErrorAction Stop
-						
+
+						# Robust raw-description fallback: if the parsed SystemSKU field did not match but the device's exact
+						# SystemSKU string is present verbatim anywhere in the raw package Description, treat it as a match.
+						# This covers Surface packages whose Description does not split into a clean SystemSKU segment via the
+						# colon parse. Safe against false positives because the device SystemSKU is a long, unique string.
+						if (($ComputerDetectionMethodResult.Detected -eq $false) -and (-not([string]::IsNullOrEmpty($ComputerData.SystemSKU))) -and (-not([string]::IsNullOrEmpty($DriverPackageItem.Description))) -and ($DriverPackageItem.Description -match [regex]::Escape($ComputerData.SystemSKU))) {
+							Write-CMLogEntry -Value "[DriverPackage:$($DriverPackageDetails.PackageID)]: Matched SystemSKU '$($ComputerData.SystemSKU)' via raw description fallback" -Severity 1
+							$ComputerDetectionMethodResult.Detected = $true
+							$ComputerDetectionMethodResult.SystemSKUValue = $ComputerData.SystemSKU
+						}
+
 						# Fall back to using computer model as the detection method instead of SystemSKU
 						if ($ComputerDetectionMethodResult.Detected -eq $false) {
 							$ComputerDetectionMethodResult = Confirm-ComputerModel -DriverPackageInput $DriverPackageDetails.Model -ComputerData $ComputerData
