@@ -157,9 +157,23 @@ Added in v5.5.0. The device is matched by **SystemSKU** (read from `MS_SystemInf
 | SystemSKU (5G, Korea) | `Surface_Pro_5G_for_Business_13in_12th_Ed_Intel_2132` |
 | Architecture | `x64` |
 
-> **Package setup:** the SCCM driver package's **Description** must contain the SystemSKU(s) above (comma-separated if you cover multiple regions/5G) — that's what the script matches on. The package **Name** should follow the DAT convention, e.g. `Drivers - Microsoft Surface Pro for Business 13in 12th Ed Intel - Windows 11 24H2 x64`.
+> **Package setup — the most common mistake:** the package's **Comment** field (this is `SMS_Package.Description`, which the script reads) must contain the **SystemSKU**, not the model name. The script matches on SystemSKU. Use this exact format:
 >
-> **Why the full SKU matters:** some numeric suffixes are shared across devices (e.g. `2077` and `2103` also appear on Surface Pro 10/11 SKUs), so the script matches the **entire** SystemSKU string, not just the number. Keep the full `Surface_Pro_..._Intel_####` value in the package Description.
+> ```
+> (Models included:Surface_Pro_for_Business_13in_12th_Ed_Intel_2103)
+> ```
+>
+> or, to cover every regional/5G variant in one package:
+>
+> ```
+> (Models included:Surface_Pro_for_Business_13in_12th_Ed_Intel_2103,Surface_Pro_for_Business_13in_12th_Ed_Intel_2134,Surface_Pro_5G_for_Business_13in_12th_Ed_Intel_2077,Surface_Pro_5G_for_Business_13in_12th_Ed_Intel_2132)
+> ```
+>
+> ❌ `(Models included:Surface Pro 12th Edition Intel)` — this is the friendly **model name**, not a SystemSKU. It will **not** match, because the device reports the SKU `Surface_Pro_for_Business_13in_12th_Ed_Intel_2103`, and the Pro 12's WMI model (`Surface Pro for Business 13in 12th Ed Intel`) doesn't equal the friendly name either, so model fallback also fails. Editing the Comment is a metadata change — **no content redistribution needed**, just re-run.
+>
+> **Why the full SKU matters:** some numeric suffixes are shared across devices (e.g. `2077` and `2103` also appear on Surface Pro 10/11 SKUs), so the script matches the **entire** SystemSKU string, not just the number. Keep the full `Surface_Pro_..._Intel_####` value in the package Comment.
+>
+> **Applies to all Surface packages:** older Surfaces happen to work with a model name in the Comment only because their WMI model equals the package's friendly name. That assumption breaks for newer devices (like the Pro 12) whose WMI model is verbose. Put the **SystemSKU** in the Comment for every Surface package — the SKU is the stable key.
 >
 > This is the **Surface Pro 12th Edition with Intel** (13-inch, x64). It is a different device from the **Surface Pro 12-inch 1st Edition**, which is Snapdragon/ARM64 only and is not covered here.
 
