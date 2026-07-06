@@ -113,6 +113,12 @@
 	# Run in a debug mode for testing purposes and overriding the automatically detected computer details (could be executed basically anywhere):
 	.\Invoke-CMApplyDriverPackage.ps1 -DebugMode -Endpoint 'CM01.domain.com' -UserName 'svc@domain.com' -Password 'svc-password' -TargetOSName 'Windows 10' -TargetOSVersion '1909' -Manufacturer 'Dell' -ComputerModel 'Precision 5520' -SystemSKU '07BF'
 
+	# Test driver package detection for a Microsoft Surface Pro 12th Edition with Intel locally in DebugMode (no task sequence required):
+	.\Invoke-CMApplyDriverPackage.ps1 -DebugMode -Endpoint 'CM01.domain.com' -UserName 'svc@domain.com' -Password 'svc-password' -TargetOSName 'Windows 11' -TargetOSVersion '24H2' -Manufacturer 'Microsoft' -ComputerModel 'Surface Pro for Business 13in 12th Ed Intel' -SystemSKU 'Surface_Pro_for_Business_13in_12th_Ed_Intel_2103'
+
+	# Validate the Surface Pro 12th Edition with Intel match during a task sequence on a virtual machine without downloading or applying drivers:
+	.\Invoke-CMApplyDriverPackage.ps1 -BareMetal -Endpoint 'CM01.domain.com' -TargetOSName 'Windows 11' -TargetOSVersion '24H2' -ValidationMode -MockManufacturer 'Microsoft' -MockSystemSKU 'Surface_Pro_for_Business_13in_12th_Ed_Intel_2103'
+
 	# Detect, download and apply drivers with remote network logging for troubleshooting:
 	.\Invoke-CMApplyDriverPackage.ps1 -BareMetal -Endpoint 'CM01.domain.com' -TargetOSName 'Windows 11' -TargetOSVersion '24H2' -NetworkLogPath '\\fileserver\OSDLogs'
 
@@ -286,6 +292,20 @@
 						 - Added -MockManufacturer, -MockModel, -MockSystemSKU parameters to simulate a real device for end-to-end matching tests on a VM
 						 - ValidationMode exits cleanly with code 0 on success so the TS step reports success when validation passes
 						 - Confirm-DriverPackageList no longer throws on empty match list when ValidationMode is set
+	5.5.0 - (2026-06-25) - Microsoft Surface Pro 12th Edition with Intel support and Surface driver package matching hardening:
+						 - Added support for matching and deploying the Microsoft Surface Pro 12th Edition with Intel driver package
+						   (System Model 'Surface Pro for Business 13in 12th Ed Intel', SystemSKU 'Surface_Pro_for_Business_13in_12th_Ed_Intel_2103')
+						 - Hardened SystemSKU extraction from the driver package Description: falls back to the full Description when the
+						   colon-delimited parse yields no value, so DAT Surface packages that store the raw SystemSKU list still match
+						 - Microsoft Surface model extraction now falls back to the manufacturer-stripped package name instead of returning
+						   null, preventing a parameter validation error when a Surface package name does not split as expected
+						 - Architecture detection now also recognizes the arm64 token so Surface Pro 12 Snapdragon sibling packages are
+						   cleanly identified and skipped for an x64 (Intel) target instead of producing a null architecture
+						 - Firmware update INFs (e.g. Microsoft Surface firmware components, Class=Firmware) are now detected and
+						   skipped during driver injection in all apply modes (BareMetal DISM Single/Recurse and DriverUpdate
+						   pnputil), preventing the driver-apply errors these firmware INFs previously caused
+						 - Trimmed the Microsoft SystemSKU read from MS_SystemInformation and guarded against a null value
+						 - Added DebugMode and ValidationMode examples for the Surface Pro 12th Edition with Intel
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -446,7 +466,7 @@ param(
 )
 Begin {
 	# Script version for logging and troubleshooting
-	$ScriptVersion = "5.4.0"
+	$ScriptVersion = "5.5.0"
 
 	# Early diagnostic output to SMSTS.log (Write-Output appears in TS logs even if script logging isn't initialized)
 	Write-Output "ApplyDriverPackage: Script version $($ScriptVersion) starting"
@@ -1322,7 +1342,12 @@ Process {
 			"*Microsoft*" {
 				$ComputerDetails.Manufacturer = "Microsoft"
 				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.SystemSKU
+				# MS_SystemInformation.SystemSKU is the authoritative identifier for Surface devices (e.g. the Surface
+				# Pro 12th Edition with Intel reports Surface_Pro_for_Business_13in_12th_Ed_Intel_2103). Trim it and
+				# guard against a null value on devices that do not populate this class.
+				if (-not([string]::IsNullOrEmpty($MSSystemInfo.SystemSKU))) {
+					$ComputerDetails.SystemSKU = $MSSystemInfo.SystemSKU.Trim()
+				}
 			}
 			"*Dell*" {
 				$ComputerDetails.Manufacturer = "Dell"
@@ -1524,12 +1549,33 @@ Process {
 				DateCreated    = $DriverPackageItem.SourceDate
 				Manufacturer   = $DriverPackageItem.Manufacturer
 				Model          = $null
-				SystemSKU      = $DriverPackageItem.Description.Split(":").Replace("(", "").Replace(")", "")[1]
+				SystemSKU      = $null
 				OSName         = $null
 				OSVersion      = $null
 				Architecture   = $null
 			}
 			
+			# Extract the SystemSKU list from the driver package Description field. The Driver Automation Tool writes the
+			# SystemSKU value(s) here. The historical format places the value after a colon (optionally wrapped in
+			# parentheses), so take the segment after the first colon once parentheses are stripped. Some Microsoft
+			# Surface packages store the raw SystemSKU list with no leading label/colon, so fall back to the full
+			# Description in that case to ensure Surface devices (such as the Surface Pro 12th Edition with Intel) still
+			# match by SystemSKU.
+			if (-not([string]::IsNullOrEmpty($DriverPackageItem.Description))) {
+				$DriverPackageDescription = $DriverPackageItem.Description.Replace("(", "").Replace(")", "")
+				$DriverPackageDetails.SystemSKU = $DriverPackageDescription.Split(":")[1]
+				if ([string]::IsNullOrWhiteSpace($DriverPackageDetails.SystemSKU)) {
+					$DriverPackageDetails.SystemSKU = $DriverPackageDescription
+				}
+				if (-not([string]::IsNullOrEmpty($DriverPackageDetails.SystemSKU))) {
+					$DriverPackageDetails.SystemSKU = $DriverPackageDetails.SystemSKU.Trim()
+				}
+			}
+
+			# Diagnostic: log the SystemSKU parsed from the package description alongside the raw description so SystemSKU
+			# match failures can be diagnosed directly from the log without guesswork.
+			Write-CMLogEntry -Value "[DriverPackage:$($DriverPackageDetails.PackageID)]: Parsed SystemSKU '$($DriverPackageDetails.SystemSKU)' from package description '$($DriverPackageItem.Description)'" -Severity 1
+
 			# Add driver package model details depending on manufacturer to custom driver package details object
 			# - Microsoft Surface packages from DAT may include "Microsoft" in the model name (e.g. "Microsoft Surface Pro 9") or just "Surface Pro 9"
 			try {
@@ -1538,11 +1584,20 @@ Process {
 						# Extract model from package name, stripping manufacturer prefix if present
 						$SurfaceModel = $DriverPackageItem.Name.Replace("Microsoft", "").Replace(" - ", ":").Split(":").Trim()[1]
 						# Normalize underscores to spaces (DAT may create packages with underscores in Surface model names)
-						$DriverPackageDetails.Model = $SurfaceModel.Replace("_", " ")
+						if (-not([string]::IsNullOrEmpty($SurfaceModel))) {
+							$DriverPackageDetails.Model = $SurfaceModel.Replace("_", " ")
+						}
 					}
 					default {
 						$DriverPackageDetails.Model = $DriverPackageItem.Name.Replace($DriverPackageItem.Manufacturer, "").Replace(" - ", ":").Split(":").Trim()[1]
 					}
+				}
+
+				# Fall back to the manufacturer-stripped package name if the model could not be parsed from the expected
+				# position. This keeps the Model populated (never null) so model-based matching cannot throw a parameter
+				# validation error when a Surface package name does not split into the expected segments.
+				if ([string]::IsNullOrEmpty($DriverPackageDetails.Model)) {
+					$DriverPackageDetails.Model = $DriverPackageItem.Name.Replace($DriverPackageItem.Manufacturer, "").Replace("_", " ").Trim()
 				}
 			}
 			catch [System.Exception] {
@@ -1550,7 +1605,9 @@ Process {
 			}
 			
 			# Add driver package OS architecture details to custom driver package details object
-			if ($DriverPackageItem.Name -match "^.*(?<Architecture>(x86|x64)).*") {
+			# arm64 is recognized so that Surface Pro 12 Snapdragon sibling packages are cleanly identified and rejected
+			# for an x64 (Intel) target rather than yielding a null architecture that would fail downstream validation.
+			if ($DriverPackageItem.Name -match "^.*(?<Architecture>(x86|x64|arm64)).*") {
 				$DriverPackageDetails.Architecture = $Matches.Architecture
 			}
 			
@@ -1583,7 +1640,17 @@ Process {
 					else {
 						# Attempt to match against SystemSKU
 						$ComputerDetectionMethodResult = Confirm-SystemSKU -DriverPackageInput $DriverPackageDetails.SystemSKU -ComputerData $ComputerData -ErrorAction Stop
-						
+
+						# Robust raw-description fallback: if the parsed SystemSKU field did not match but the device's exact
+						# SystemSKU string is present verbatim anywhere in the raw package Description, treat it as a match.
+						# This covers Surface packages whose Description does not split into a clean SystemSKU segment via the
+						# colon parse. Safe against false positives because the device SystemSKU is a long, unique string.
+						if (($ComputerDetectionMethodResult.Detected -eq $false) -and (-not([string]::IsNullOrEmpty($ComputerData.SystemSKU))) -and (-not([string]::IsNullOrEmpty($DriverPackageItem.Description))) -and ($DriverPackageItem.Description -match [regex]::Escape($ComputerData.SystemSKU))) {
+							Write-CMLogEntry -Value "[DriverPackage:$($DriverPackageDetails.PackageID)]: Matched SystemSKU '$($ComputerData.SystemSKU)' via raw description fallback" -Severity 1
+							$ComputerDetectionMethodResult.Detected = $true
+							$ComputerDetectionMethodResult.SystemSKUValue = $ComputerData.SystemSKU
+						}
+
 						# Fall back to using computer model as the detection method instead of SystemSKU
 						if ($ComputerDetectionMethodResult.Detected -eq $false) {
 							$ComputerDetectionMethodResult = Confirm-ComputerModel -DriverPackageInput $DriverPackageDetails.Model -ComputerData $ComputerData
@@ -1703,7 +1770,8 @@ Process {
 						}
 						
 						# Add driver package OS architecture details to custom driver package details object
-						if ($DriverPackageItem.Name -match "^.*(?<Architecture>(x86|x64)).*") {
+						# arm64 is recognized here too so an ARM64 Microsoft fallback package cannot yield a null architecture
+						if ($DriverPackageItem.Name -match "^.*(?<Architecture>(x86|x64|arm64)).*") {
 							$DriverPackageDetails.Architecture = $Matches.Architecture
 						}
 						
@@ -1946,10 +2014,12 @@ Process {
 			}
 			else {
 				# SystemSKU match was not found based upon multiple items detected in computer data input
+				Write-CMLogEntry -Value " - Could not match SystemSKU (multi-value). Computer SystemSKU: '$($ComputerData.SystemSKU)' | Driver package SystemSKU input: '$($DriverPackageInput)'" -Severity 2
+
 				# Set properties for custom object for return value
 				$SystemSKUDetectionResult.SystemSKUValue = ""
 				$SystemSKUDetectionResult.Detected = $false
-				
+
 				return $SystemSKUDetectionResult
 			}
 		}
@@ -1975,10 +2045,12 @@ Process {
 		}
 		else {
 			# None of the above methods worked to match SystemSKU from driver package input with computer data input
+			Write-CMLogEntry -Value " - Could not match SystemSKU. Computer SystemSKU: '$($ComputerData.SystemSKU)' | Driver package SystemSKU input: '$($DriverPackageInput)'" -Severity 2
+
 			# Set properties for custom object for return value
 			$SystemSKUDetectionResult.SystemSKUValue = ""
 			$SystemSKUDetectionResult.Detected = $false
-			
+
 			return $SystemSKUDetectionResult
 		}
 	}
@@ -2472,6 +2544,33 @@ Process {
 		}
 	}
 	
+	function Test-FirmwareDriverInf {
+		param (
+			[parameter(Mandatory = $true, HelpMessage = "Specify the full path to the driver INF file to inspect.")]
+			[ValidateNotNullOrEmpty()]
+			[string]$Path
+		)
+		# Surface driver/firmware packages include firmware update components whose INF files declare the Firmware
+		# setup class (Class=Firmware / ClassGuid {f2e7dd72-6468-4e36-b6f1-6488f42c1b52}). These cannot be injected
+		# into an offline image with DISM /Add-Driver and previously caused driver application to error out, so they
+		# must be skipped. Returns $true when the INF is a firmware update package.
+		try {
+			$InfContent = Get-Content -Path $Path -Raw -ErrorAction Stop
+			if ($InfContent -match "(?im)^\s*Class\s*=\s*Firmware\b") {
+				return $true
+			}
+			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") {
+				return $true
+			}
+			return $false
+		}
+		catch [System.Exception] {
+			# If the INF cannot be read, do not treat it as firmware so normal injection still attempts it
+			Write-CMLogEntry -Value " - WARNING: Unable to read INF for firmware classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
+			return $false
+		}
+	}
+
 	function Install-DriverPackageContent {
 		param (
 			[parameter(Mandatory = $true, HelpMessage = "Specify the full local path to the downloaded driver package content.")]
@@ -2647,6 +2746,31 @@ Process {
 			}
 		}
 		
+		# Skip firmware update INFs (e.g. Microsoft Surface firmware components) before applying drivers. These declare
+		# the Firmware setup class and cannot be injected into an offline image with DISM /Add-Driver, and would also be
+		# picked up by pnputil during DriverUpdate. Renaming them out of the "*.inf" pattern excludes them from every
+		# injection method (DISM /Recurse, per-INF DISM, and pnputil /subdirs) without deleting any content.
+		try {
+			$ContentINFs = Get-ChildItem -Path $ContentLocation -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue
+			$FirmwareINFCount = 0
+			foreach ($ContentINF in $ContentINFs) {
+				if (Test-FirmwareDriverInf -Path $ContentINF.FullName) {
+					Write-CMLogEntry -Value " - Skipping firmware INF (excluded from driver injection): $($ContentINF.FullName)" -Severity 1
+					Rename-Item -Path $ContentINF.FullName -NewName "$($ContentINF.Name).firmware_skipped" -Force -ErrorAction Stop
+					$FirmwareINFCount++
+				}
+			}
+			if ($FirmwareINFCount -gt 0) {
+				Write-CMLogEntry -Value " - Excluded $($FirmwareINFCount) firmware INF file(s) from driver injection" -Severity 1
+			}
+			else {
+				Write-CMLogEntry -Value " - No firmware INF files detected in driver package content" -Severity 1
+			}
+		}
+		catch [System.Exception] {
+			Write-CMLogEntry -Value " - WARNING: An error occurred while excluding firmware INF files. Error message: $($_.Exception.Message)" -Severity 2
+		}
+
 		switch ($Script:DeploymentMode) {
 			"BareMetal" {
 				# Apply drivers recursively from downloaded driver package location
