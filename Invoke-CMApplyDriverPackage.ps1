@@ -306,6 +306,9 @@
 						   pnputil), preventing the driver-apply errors these firmware INFs previously caused
 						 - Trimmed the Microsoft SystemSKU read from MS_SystemInformation and guarded against a null value
 						 - Added DebugMode and ValidationMode examples for the Surface Pro 12th Edition with Intel
+5.5.1 - (2026-08-06) - DISM ScratchDir parameter fix:
+- Added /ScratchDir parameter pointing to C:\Windows\Temp for DISM driver injection commands in BareMetal mode
+- Solves DISM error 112 (ERROR_DISK_FULL) when applying large driver packages (e.g., Dell Latitude 5540) on systems with limited WinPE RAM disk scratch space
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -2776,6 +2779,12 @@ Process {
 				# Apply drivers recursively from downloaded driver package location
 				Write-CMLogEntry -Value " - Attempting to apply drivers using dism.exe located in: $($ContentLocation)" -Severity 1
 				
+				# Ensure scratch directory exists on target OS drive for DISM temporary expansion
+				$ScratchDir = "$($TSEnvironment.Value('OSDTargetSystemDrive'))\Windows\Temp"
+				if (-not (Test-Path -Path $ScratchDir)) {
+					New-Item -Path $ScratchDir -ItemType Directory -Force | Out-Null
+				}
+				
 				# Determine driver injection method from parameter input
 				switch ($DriverInstallMode) {
 					"Single" {
@@ -2788,7 +2797,7 @@ Process {
 								foreach ($DriverINF in $DriverINFs) {
 									# Install specific driver
 									Write-CMLogEntry -Value " - Attempting to install driver: $($DriverINF.FullName)" -Severity 1
-									$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:`"$($DriverINF.FullName)`" /ForceUnsigned"
+									$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:`"$($DriverINF.FullName)`" /ForceUnsigned /ScratchDir:`"$ScratchDir`""
 									
 									# Validate driver injection
 									if ($ApplyDriverInvocation -eq 0) {
@@ -2819,7 +2828,7 @@ Process {
 						Write-CMLogEntry -Value " - DriverInstallMode is currently set to: $($DriverInstallMode)" -Severity 1
 						
 						# Apply drivers recursively
-						$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:$($ContentLocation) /Recurse /ForceUnsigned"
+						$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:$($ContentLocation) /Recurse /ForceUnsigned /ScratchDir:`"$ScratchDir`""
 						
 						# Validate driver injection
 						if ($ApplyDriverInvocation -eq 0) {
