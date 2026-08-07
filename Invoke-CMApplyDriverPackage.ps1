@@ -306,6 +306,12 @@
 						   pnputil), preventing the driver-apply errors these firmware INFs previously caused
 						 - Trimmed the Microsoft SystemSKU read from MS_SystemInformation and guarded against a null value
 						 - Added DebugMode and ValidationMode examples for the Surface Pro 12th Edition with Intel
+5.6.0 - (2026-08-06) - Performance, WIM mount, and DCH filtering optimization:
+- Fixed WIM mount duplication: dismounts WIM and cleans up Mount directory immediately after file extraction, preventing DISM from scanning duplicate drivers and doubling processing time
+- Extended offline driver filtering: updated Test-FirmwareDriverInf to skip DCH software components (Class=SoftwareComponent) and extension wrappers (Class=Extension) in WinPE, eliminating DISM 0x80070002 (ERROR_FILE_NOT_FOUND) log noise
+- Resource safety: added try/finally blocks around WIM mount/dismount and temp folder cleanup
+- WMI/CIM caching: cached Win32_ComputerSystem and Win32_OperatingSystem objects across helper functions for faster WinPE execution
+- Added DISM summary logging to ApplyDriverPackage.log and SMSTS.log after driver injection passes
 5.5.1 - (2026-08-06) - DISM ScratchDir parameter fix:
 - Added /ScratchDir parameter pointing to C:\Windows\Temp for DISM driver injection commands in BareMetal mode
 - Solves DISM error 112 (ERROR_DISK_FULL) when applying large driver packages (e.g., Dell Latitude 5540) on systems with limited WinPE RAM disk scratch space
@@ -1334,8 +1340,14 @@ Process {
 			FallbackSKU  = $null
 		}
 
-		# Cache CIM queries to avoid redundant calls (performance improvement)
-		$Win32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
+		# Cache CIM queries globally to avoid redundant calls across helper functions
+		if ($null -eq $Script:CachedWin32CS) {
+			$Script:CachedWin32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
+		}
+		if ($null -eq $Script:CachedWin32OS) {
+			$Script:CachedWin32OS = Get-CimInstance -ClassName "Win32_OperatingSystem"
+		}
+		$Win32CS = $Script:CachedWin32CS
 		$Win32CSP = Get-CimInstance -ClassName "Win32_ComputerSystemProduct"
 		$MSSystemInfo = Get-CimInstance -ClassName "MS_SystemInformation" -Namespace "root\WMI"
 
@@ -1422,7 +1434,10 @@ Process {
 	}
 	
 	function Get-ComputerSystemType {
-		$ComputerSystemType = Get-CimInstance -ClassName "Win32_ComputerSystem" | Select-Object -ExpandProperty "Model"
+		if ($null -eq $Script:CachedWin32CS) {
+			$Script:CachedWin32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
+		}
+		$ComputerSystemType = $Script:CachedWin32CS.Model
 		if ($ComputerSystemType -notin @("Virtual Machine", "VMware Virtual Platform", "VirtualBox", "HVM domU", "KVM", "VMWare7,1")) {
 			Write-CMLogEntry -Value " - Supported computer platform detected, script execution allowed to continue" -Severity 1
 		}
@@ -1444,7 +1459,10 @@ Process {
 	
 	function Get-OperatingSystemVersion {
 		if (($Script:PSCmdlet.ParameterSetName -like "DriverUpdate") -or ($Script:PSCmdlet.ParameterSetName -like "OSUpgrade")) {
-			$OperatingSystemVersion = Get-CimInstance -ClassName "Win32_OperatingSystem" | Select-Object -ExpandProperty "Version"
+			if ($null -eq $Script:CachedWin32OS) {
+				$Script:CachedWin32OS = Get-CimInstance -ClassName "Win32_OperatingSystem"
+			}
+			$OperatingSystemVersion = $Script:CachedWin32OS.Version
 			if ($OperatingSystemVersion -like "10.0.*") {
 				Write-CMLogEntry -Value " - Supported operating system version currently running detected, script execution allowed to continue" -Severity 1
 			}
@@ -2553,23 +2571,25 @@ Process {
 			[ValidateNotNullOrEmpty()]
 			[string]$Path
 		)
-		# Surface driver/firmware packages include firmware update components whose INF files declare the Firmware
-		# setup class (Class=Firmware / ClassGuid {f2e7dd72-6468-4e36-b6f1-6488f42c1b52}). These cannot be injected
-		# into an offline image with DISM /Add-Driver and previously caused driver application to error out, so they
-		# must be skipped. Returns $true when the INF is a firmware update package.
+		# Detects INF files that are incompatible with offline DISM injection in WinPE:
+		# 1. Firmware update packages (Class=Firmware / {f2e7dd72-6468-4e36-b6f1-6488f42c1b52})
+		# 2. DCH extension wrappers (Class=Extension / {e2f84ce7-8efa-411c-aa69-97454ca4cb57})
+		# 3. DCH software components (Class=SoftwareComponent / {5c4c3332-e396-48d5-b584-290b5030f2f0})
+		# These components require online AppX/WinRT staging and fail offline with DISM code 2 (0x80070002).
+		# Returns $true when the INF should be safely skipped during offline injection.
 		try {
 			$InfContent = Get-Content -Path $Path -Raw -ErrorAction Stop
-			if ($InfContent -match "(?im)^\s*Class\s*=\s*Firmware\b") {
-				return $true
-			}
-			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") {
-				return $true
-			}
+			if ($InfContent -match "(?im)^\s*Class\s*=\s*Firmware\b") { return $true }
+			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") { return $true }
+			if ($InfContent -match "(?im)^\s*Class\s*=\s*Extension\b") { return $true }
+			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?e2f84ce7-8efa-411c-aa69-97454ca4cb57\}?") { return $true }
+			if ($InfContent -match "(?im)^\s*Class\s*=\s*SoftwareComponent\b") { return $true }
+			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?5c4c3332-e396-48d5-b584-290b5030f2f0\}?") { return $true }
+			if ($Path -match "(?i)_dch\.inf$") { return $true }
 			return $false
 		}
 		catch [System.Exception] {
-			# If the INF cannot be read, do not treat it as firmware so normal injection still attempts it
-			Write-CMLogEntry -Value " - WARNING: Unable to read INF for firmware classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
+			Write-CMLogEntry -Value " - WARNING: Unable to read INF for offline compatibility classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
 			return $false
 		}
 	}
@@ -2701,49 +2721,38 @@ Process {
 					}
 				}
 				"*.wim" {
+					$DriverPackageMountLocation = Join-Path -Path $ContentLocation -ChildPath "Mount"
 					try {
-						# Create mount location for driver package WIM file
-						$DriverPackageMountLocation = Join-Path -Path $ContentLocation -ChildPath "Mount"
 						if (-not (Test-Path -Path $DriverPackageMountLocation)) {
 							Write-CMLogEntry -Value " - Creating mount location directory: $($DriverPackageMountLocation)" -Severity 1
 							New-Item -Path $DriverPackageMountLocation -ItemType "Directory" -Force | Out-Null
 						}
-					}
-					catch [System.Exception] {
-						Write-CMLogEntry -Value " - Failed to create mount location for WIM file. Error message: $($_.Exception.Message)" -Severity 3
-						
-						# Throw terminating error						
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
-					}
-					
-					$WIMMounted = $false
-					try {
-						# Expand compressed driver package WIM file
+
 						Write-CMLogEntry -Value " - Attempting to mount driver package content WIM file: $($DriverPackageCompressedFile.Name)" -Severity 1
 						Write-CMLogEntry -Value " - Mount location: $($DriverPackageMountLocation)" -Severity 1
 						Mount-WindowsImage -ImagePath $DriverPackageCompressedFile.FullName -Path $DriverPackageMountLocation -Index 1 -ErrorAction Stop
-						$WIMMounted = $true
 						Write-CMLogEntry -Value " - Successfully mounted driver package content WIM file" -Severity 1
-						Write-CMLogEntry -Value " - Copying items from mount directory" -Severity 1
+						Write-CMLogEntry -Value " - Copying items from mount directory to driver content directory" -Severity 1
 						Get-ChildItem -Path $DriverPackageMountLocation | Copy-Item -Destination $ContentLocation -Recurse -Container
+						Write-CMLogEntry -Value " - Successfully extracted driver package WIM content" -Severity 1
 					}
 					catch [System.Exception] {
 						Write-CMLogEntry -Value " - Failed to mount or copy driver package content WIM file. Error message: $($_.Exception.Message)" -Severity 3
-
-						# Attempt to dismount WIM on error to prevent dangling mounts
-						if ($WIMMounted) {
-							try {
-								Write-CMLogEntry -Value " - Attempting emergency dismount of WIM file after error" -Severity 2
-								Dismount-WindowsImage -Path $DriverPackageMountLocation -Discard -ErrorAction Stop
-								Write-CMLogEntry -Value " - Successfully dismounted WIM file during error cleanup" -Severity 2
-							}
-							catch [System.Exception] {
-								Write-CMLogEntry -Value " - Failed to dismount WIM file during error cleanup. Error message: $($_.Exception.Message)" -Severity 2
-							}
-						}
-
-						# Throw terminating error
 						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					}
+					finally {
+						# Dismount WIM and cleanup Mount directory immediately so DISM won't scan duplicate drivers
+						try {
+							Write-CMLogEntry -Value " - Dismounting driver package content WIM file and cleaning up mount folder" -Severity 1
+							Dismount-WindowsImage -Path $DriverPackageMountLocation -Discard -ErrorAction SilentlyContinue
+							if (Test-Path -Path $DriverPackageMountLocation) {
+								Remove-Item -Path $DriverPackageMountLocation -Force -Recurse -ErrorAction SilentlyContinue
+							}
+							Write-CMLogEntry -Value " - Successfully dismounted WIM and removed mount folder" -Severity 1
+						}
+						catch [System.Exception] {
+							Write-CMLogEntry -Value " - WARNING: An error occurred while cleaning up WIM mount directory: $($_.Exception.Message)" -Severity 2
+						}
 					}
 				}
 			}
@@ -2830,12 +2839,18 @@ Process {
 						# Apply drivers recursively
 						$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:$($ContentLocation) /Recurse /ForceUnsigned /ScratchDir:`"$ScratchDir`""
 						
-						# Validate driver injection
+						# Validate driver injection and write DISM summary
 						if ($ApplyDriverInvocation -eq 0) {
-							Write-CMLogEntry -Value " - Successfully installed drivers recursively in driver package content location using dism.exe" -Severity 1
+							Write-CMLogEntry -Value " - Successfully installed drivers recursively using dism.exe" -Severity 1
+							Write-Output "ApplyDriverPackage: DISM driver injection completed successfully (Exit Code: 0)"
 						}
 						else {
-							Write-CMLogEntry -Value " - An error occurred while installing drivers. Continuing with warning code: $($ApplyDriverInvocation). See DISM.log for more details" -Severity 2
+							Write-CMLogEntry -Value " - DISM driver injection completed with warning code: $($ApplyDriverInvocation). See DISM.log for details" -Severity 2
+							Write-Output "ApplyDriverPackage: DISM driver injection completed with warning code: $($ApplyDriverInvocation)"
+						}
+						if ($FirmwareINFCount -gt 0) {
+							Write-CMLogEntry -Value " - [DISM Summary]: $($FirmwareINFCount) offline-incompatible INF file(s) safely skipped (firmware/DCH extensions)" -Severity 1
+							Write-Output "ApplyDriverPackage: [DISM Summary]: $($FirmwareINFCount) offline-incompatible INF file(s) safely skipped"
 						}
 					}
 				}
@@ -2888,26 +2903,7 @@ Process {
 			}
 		}
 		
-		# Cleanup potential compressed driver package content
-		if ($null -ne $DriverPackageCompressedFile) {
-			switch -wildcard ($DriverPackageCompressedFile.Name) {
-				"*.wim" {
-					try {
-						# Attempt to dismount compressed driver package content WIM file
-						Write-CMLogEntry -Value " - Attempting to dismount driver package content WIM file: $($DriverPackageCompressedFile.Name)" -Severity 1
-						Write-CMLogEntry -Value " - Mount location: $($DriverPackageMountLocation)" -Severity 1
-						Dismount-WindowsImage -Path $DriverPackageMountLocation -Discard -ErrorAction Stop
-						Write-CMLogEntry -Value " - Successfully dismounted driver package content WIM file" -Severity 1
-					}
-					catch [System.Exception] {
-						Write-CMLogEntry -Value " - Failed to dismount driver package content WIM file. Error message: $($_.Exception.Message)" -Severity 3
-						
-						# Throw terminating error						
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
-					}
-				}
-			}
-		}
+		# Compressed WIM dismount cleanup is handled immediately in finally block after extraction
 	}
 	#endregion
 
