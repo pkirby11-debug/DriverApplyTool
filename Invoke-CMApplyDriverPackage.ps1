@@ -306,15 +306,76 @@
 						   pnputil), preventing the driver-apply errors these firmware INFs previously caused
 						 - Trimmed the Microsoft SystemSKU read from MS_SystemInformation and guarded against a null value
 						 - Added DebugMode and ValidationMode examples for the Surface Pro 12th Edition with Intel
-5.6.0 - (2026-08-06) - Performance, WIM mount, and DCH filtering optimization:
-- Fixed WIM mount duplication: dismounts WIM and cleans up Mount directory immediately after file extraction, preventing DISM from scanning duplicate drivers and doubling processing time
-- Extended offline driver filtering: updated Test-FirmwareDriverInf to skip DCH software components (Class=SoftwareComponent) and extension wrappers (Class=Extension) in WinPE, eliminating DISM 0x80070002 (ERROR_FILE_NOT_FOUND) log noise
-- Resource safety: added try/finally blocks around WIM mount/dismount and temp folder cleanup
-- WMI/CIM caching: cached Win32_ComputerSystem and Win32_OperatingSystem objects across helper functions for faster WinPE execution
-- Added DISM summary logging to ApplyDriverPackage.log and SMSTS.log after driver injection passes
 5.5.1 - (2026-08-06) - DISM ScratchDir parameter fix:
 - Added /ScratchDir parameter pointing to C:\Windows\Temp for DISM driver injection commands in BareMetal mode
 - Solves DISM error 112 (ERROR_DISK_FULL) when applying large driver packages (e.g., Dell Latitude 5540) on systems with limited WinPE RAM disk scratch space
+5.6.3 - (2026-10-29) - Driver step failing 30 seconds into the download (Dell Pro Micro QCM1250 field investigation):
+						 - Fixed the 5.6.2 heartbeat failing the step it was reporting on. Invoke-Executable writes a heartbeat every 30
+						   seconds with the last line of -ProgressLogPath, but only the DISM calls pass that parameter and Get-LogTailText
+						   rejected the empty path ("The argument is null or empty"). Every OSDDownloadContent.exe, pnputil, msiexec, expand
+						   and 7-Zip call still running at 30 seconds was abandoned: on the QCM1250 the 3.86 GB WIM finished downloading
+						   5 seconds after the step had already failed. Get-LogTailText now returns nothing for an empty path, and a
+						   heartbeat that cannot be written is logged as a warning while the wait carries on
+						 - Invoke-Executable rethrows every error instead of using break. Outside a loop, break leaves through the nearest
+						   loop or switch further up the call stack, or quietly ends the script when there is none. It skipped the download
+						   error handling (the blank "unhandled exit code"), could cut the per-INF DISM loop short, and in DriverUpdate mode
+						   left the pnputil branch early so the registry stamp was written for drivers that had not finished installing
+						 - Timeout output splits the last 20 log lines with -split. String.Split(" | ") in Windows PowerShell 5.1 splits on
+						   every space and pipe character, which logged one word per line
+						 - DISM calls no longer pass -TimeoutSeconds (Get-RuntimeBudget). Invoke-Executable already applies the remaining
+						   budget, and an exhausted budget (-1) failed parameter validation instead of reporting that the budget ran out
+						 - An inaccessible -NetworkLogPath now logs one warning instead of an additional Test-Path error record in smsts.log
+5.6.2 - (2026-10-27) - Evidence from a hung build, and the ability to walk away from one:
+						 - New -MaxRuntimeMinutes budget (default 60, 0 disables). Every phase announces itself, the download and DISM calls
+						   are bounded by what is left of the budget, and when it runs out the step fails with the phase it was stuck in
+						   instead of stalling the task sequence indefinitely
+						 - Long running child processes now report in. Invoke-Executable polls instead of blocking and writes a heartbeat
+						   every 30 seconds, including the last DISM log line, so the log distinguishes "still working" from "wedged" and
+						   names the INF a stuck DISM call is sitting on
+						 - On timeout or budget expiry the last 20 lines of the relevant log are written to ApplyDriverPackage.log and the
+						   mounted WIM is dismounted with -Discard, so a wedged build stops poisoning the next attempt
+						 - -NetworkLogPath can now be supplied through the task sequence variable OSDApplyDriverPackageNetworkLog, so one Set
+						   Task Sequence Variable step mirrors every driver step to a share without editing the steps. Needed because WinPE
+						   logs live on the X: RAM disk and are destroyed by a reset - a hung build currently leaves nothing to read
+						 - Network log writes retry after a transient failure instead of disabling mirroring for the rest of the run
+5.6.1 - (2026-10-27) - False-positive injection failures, copy path restored (Dell Latitude 5530 field investigation):
+						 - Fixed case-sensitive DISM log parsing: the INF match patterns required a lowercase ".inf" while DISM logs the file
+						   name as it exists on disk, so every driver whose INF is named *.INF (Netwtw08.INF, Netwtw6e.INF, rtu5xCx22x64sta.INF,
+						   WavesDMIC_AGC.INF and friends) was missing from the "processed" set and was reported as a failed injection even
+						   though DISM installed it correctly. Seven false failures on a Latitude 5530 package
+						 - Driver injection now reports the setupapi code from the DISM log next to each failed INF instead of a bare file name
+						 - Mounted content is copied to local disk again for every manufacturer. Injecting from the read-only mount was measured
+						   slower overall: DISM reads each payload file through WIM decompression, which doubled INF enumeration (25 s vs 14 s) and
+						   made large graphics packages four times slower (43.6 s for iigd_dch against 8.9-11.4 s from a local copy).
+						   -InjectFromMount brings the old behaviour back for measurement
+						 - The DISM /LogPath is a dedicated file again (dism-ApplyDriverPackage.log). Sharing dism.log with the native Apply Driver
+						   Package step mixed two runs into one file, which polluted the processed count
+						 - Read-only sources now log one exclusion summary line instead of one line per non-injectable INF (61 lines on a
+						   Latitude 5530 package)
+5.6.0 - (2026-10-27) - Driver injection performance and hang prevention (Dell Pro Micro QCM1250 field investigation):
+						 - The driver package WIM is now mounted to a sibling folder of the content location instead of inside it. With the mount
+						   living under the content folder, DISM /Recurse enumerated the mounted tree AND the copy of it, injecting every driver
+						   twice: a 255 INF Dell package became 510 install operations, roughly 40 seconds of duplicate work per build
+						 - Mounted content is no longer copied out for Dell and Lenovo packages; drivers are injected directly from the read-only
+						   mount, saving about 36 seconds on a 3.9 GB package. Microsoft Surface packages (and DriverUpdate mode) still copy,
+						   because the firmware INF exclusion needs a writable tree
+						 - Mount folder is removed after dismount so stale mount directories no longer accumulate in the task sequence cache
+						 - SMSTSDownloadRetryCount lowered from 1000 to 20 with SMSTSDownloadRetryDelay 10. The old value, combined with the 15 second
+						   default delay, let a misdirected boundary group or unreachable DP retry for about 4 hours with no log output - the
+						   reported "hang" at the Apply Drivers step
+						 - Package content download is now bounded by -DownloadTimeoutMinutes (default 45): on expiry OSDDownloadContent.exe is
+						   terminated and the step fails with the package ID and elapsed time in the log
+						 - DISM driver injection now passes /LogPath so INF-level failures land in the collected SMSTSLog instead of
+						   X:\Windows\Logs\DISM\dism.log, which is never harvested with the task sequence logs
+						 - Added a post-injection DISM log parse: failing INFs are listed by name and separated into expected failures
+						   (Firmware, SoftwareComponent and Extension classes cannot be injected into an offline image) and real hardware
+						   driver failures
+						 - New -FailOnDriverInjectionError switch makes a real driver injection failure fail the task sequence rather than
+						   logging a warning and reporting success
+						 - Driver INF exclusion is now class based (Firmware, SoftwareComponent, Extension) and no longer aborts the whole loop
+						   when a single rename fails. A package whose INF could not be renamed previously lost the exclusion entirely
+						 - Fixed the misleading "No driver package matched" summary printed on successful builds: Confirm-DriverPackageList
+						   replaces the list with a single object, so the summary now uses @() and logs the selected package ID and name
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -464,6 +525,28 @@ param(
 	[ValidateNotNullOrEmpty()]
 	[string]$MockSystemSKU,
 
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Maximum number of minutes to wait for OSDDownloadContent.exe to finish before terminating it and failing the step. Default 45.")]
+	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
+	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
+	[parameter(Mandatory = $false, ParameterSetName = "PreCache")]
+	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
+	[ValidateRange(5, 1440)]
+	[int]$DownloadTimeoutMinutes = 45,
+
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Fail the task sequence when a real hardware driver INF fails to inject, instead of logging a warning and continuing.")]
+	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
+	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
+	[parameter(Mandatory = $false, ParameterSetName = "PreCache")]
+	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
+	[switch]$FailOnDriverInjectionError,
+
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Inject drivers directly from the read-only WIM mount instead of copying the package to local disk first. Costs nothing in copy time but makes DISM read every payload file through WIM decompression, which measured slower overall on 3-4 GB Dell packages.")]
+	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
+	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
+	[parameter(Mandatory = $false, ParameterSetName = "PreCache")]
+	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
+	[switch]$InjectFromMount,
+
 	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Specify a UNC path to write a duplicate log file for remote troubleshooting, e.g. '\\\\server\\share\\OSDLogs'.")]
 	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
 	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
@@ -471,11 +554,29 @@ param(
 	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
 	[parameter(Mandatory = $false, ParameterSetName = "XMLPackage")]
 	[ValidateNotNullOrEmpty()]
-	[string]$NetworkLogPath
+	[string]$NetworkLogPath,
+
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Total minutes the script may run before it stops waiting on whatever is stuck and fails the step. Default 60, 0 disables the budget.")]
+	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
+	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
+	[parameter(Mandatory = $false, ParameterSetName = "PreCache")]
+	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
+	[ValidateRange(0, 1440)]
+	[int]$MaxRuntimeMinutes = 60
 )
 Begin {
 	# Script version for logging and troubleshooting
-	$ScriptVersion = "5.5.0"
+	$ScriptVersion = "5.6.3"
+
+	# Network log retry state
+	$Script:NetworkLogFailures = 0
+	$Script:NetworkLogRetryAfter = [datetime]::MinValue
+
+	# Runtime budget. Nothing bounded the script as a whole before 5.6.2: the download was bounded, but a wedged mount, copy or
+	# DISM call stalled the step with no output and no way out short of resetting the machine. Every phase now names itself in
+	# $Script:CurrentPhase so that running out of budget reports where it happened.
+	$Script:RuntimeWatch = [System.Diagnostics.Stopwatch]::StartNew()
+	$Script:CurrentPhase = "initialisation"
 
 	# Early diagnostic output to SMSTS.log (Write-Output appears in TS logs even if script logging isn't initialized)
 	Write-Output "ApplyDriverPackage: Script version $($ScriptVersion) starting"
@@ -485,15 +586,35 @@ Begin {
 	if ($PSBoundParameters.ContainsKey("TargetOSVersion")) { Write-Output "ApplyDriverPackage: TargetOSVersion: $($TargetOSVersion)" }
 	if ($PSBoundParameters.ContainsKey("NetworkLogPath")) { Write-Output "ApplyDriverPackage: NetworkLogPath: $($NetworkLogPath)" }
 
+	# A network log path supplied through a task sequence variable means one Set Task Sequence Variable step can mirror every
+	# driver step to a share. This matters for hang investigations: WinPE logs are written to the X: RAM disk, which is wiped by
+	# a power cycle, so a build that hangs and gets reset leaves nothing to read unless the log is already off the box.
+	if ([string]::IsNullOrEmpty($NetworkLogPath) -and ($PSCmdLet.ParameterSetName -notlike "Debug")) {
+		try {
+			$TSEnvironmentVariableLog = (New-Object -ComObject "Microsoft.SMS.TSEnvironment" -ErrorAction Stop).Value("OSDApplyDriverPackageNetworkLog")
+			if (-not([string]::IsNullOrEmpty($TSEnvironmentVariableLog))) {
+				$NetworkLogPath = $TSEnvironmentVariableLog
+				Write-Output "ApplyDriverPackage: Network log path taken from task sequence variable OSDApplyDriverPackageNetworkLog: $($NetworkLogPath)"
+			}
+		}
+		catch {
+			# Not fatal: the variable is optional
+		}
+	}
+
 	# Generate unique network log file name using computer name and timestamp
 	if (-not([string]::IsNullOrEmpty($NetworkLogPath))) {
 		$NetworkLogFileName = "ApplyDriverPackage_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 		$Script:NetworkLogFilePath = Join-Path -Path $NetworkLogPath -ChildPath $NetworkLogFileName
 		try {
-			if (-not(Test-Path -Path $NetworkLogPath)) {
+			# -ErrorAction Stop: an access denied share otherwise writes its own error record into smsts.log on top of the
+			# warning below, which reads as a second failure (WinPE runs as SYSTEM with no credentials for the share)
+			if (-not(Test-Path -Path $NetworkLogPath -ErrorAction Stop)) {
 				New-Item -Path $NetworkLogPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
 			}
 			Write-Output "ApplyDriverPackage: Network log will be written to: $($Script:NetworkLogFilePath)"
+			# The mirror is the only reason a build that hangs and gets power cycled leaves any evidence behind
+			if (-not([string]::IsNullOrEmpty($NetworkLogPath))) { Write-Output "ApplyDriverPackage: Log entries are mirrored off this machine as they are written" }
 		}
 		catch {
 			Write-Output "ApplyDriverPackage: WARNING - Could not access network log path: $($NetworkLogPath). Error: $($_.Exception.Message)"
@@ -581,17 +702,99 @@ Process {
 			Write-Warning -Message "Unable to append log entry to ApplyDriverPackage.log file. Error message at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
 		}
 
-		# Write duplicate log entry to network path if specified
-		if (-not([string]::IsNullOrEmpty($Script:NetworkLogFilePath))) {
+		# Write duplicate log entry to network path if specified. A failed write retries on a timer rather than switching the
+		# mirror off for the rest of the run: losing the network copy after one hiccup defeats the purpose of having it.
+		if ((-not([string]::IsNullOrEmpty($Script:NetworkLogFilePath))) -and ((Get-Date) -ge $Script:NetworkLogRetryAfter)) {
 			try {
 				Out-File -InputObject $LogText -Append -NoClobber -Encoding UTF8 -FilePath $Script:NetworkLogFilePath -ErrorAction Stop
+				$Script:NetworkLogFailures = 0
 			}
 			catch {
-				# Network logging failures are non-fatal - silently continue
+				$Script:NetworkLogFailures++
+				$Script:NetworkLogRetryAfter = (Get-Date).AddSeconds([math]::Min(300, 15 * $Script:NetworkLogFailures))
 			}
 		}
 	}
 	
+	function Get-RuntimeBudget {
+		param(
+			[parameter(Mandatory = $false, HelpMessage = "Specify a caller supplied limit in seconds. The tighter of this and the remaining runtime budget is returned. Zero means unlimited.")]
+			[int]$DesiredSeconds = 0
+		)
+		# Returns the effective time limit for the next blocking operation. Zero means unlimited, which only happens when
+		# -MaxRuntimeMinutes was set to 0 by the operator.
+		if ($Script:MaxRuntimeMinutes -le 0) { return $DesiredSeconds }
+
+		$RemainingSeconds = [int][math]::Floor(($Script:MaxRuntimeMinutes * 60) - $Script:RuntimeWatch.Elapsed.TotalSeconds)
+		if ($RemainingSeconds -le 0) { return -1 }
+
+		if ($DesiredSeconds -le 0) { return $RemainingSeconds }
+		return [math]::Min($DesiredSeconds, $RemainingSeconds)
+	}
+
+	function Assert-RuntimeBudget {
+		param(
+			[parameter(Mandatory = $true, HelpMessage = "Specify the phase about to start, used in the failure message.")]
+			[ValidateNotNullOrEmpty()]
+			[string]$Phase
+		)
+		# Called before each phase so a build that has already burnt the budget stops before starting more work
+		if ($Script:MaxRuntimeMinutes -le 0) { return }
+
+		$RemainingSeconds = Get-RuntimeBudget
+		if ($RemainingSeconds -lt 0) {
+			Write-CMLogEntry -Value " - Runtime budget of $($Script:MaxRuntimeMinutes) minute(s) is exhausted; refusing to start phase '$($Phase)'" -Severity 3
+			Write-Host "ApplyDriverPackage: TIMEOUT - runtime budget of $($Script:MaxRuntimeMinutes) minute(s) exhausted during '$($Script:CurrentPhase)', cannot start '$($Phase)'"
+			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Runtime budget of $($Script:MaxRuntimeMinutes) minute(s) exhausted after phase '$($Script:CurrentPhase)' while starting '$($Phase)'. Raise -MaxRuntimeMinutes or set it to 0 if this package legitimately needs longer."))
+		}
+	}
+
+	function Get-LogTailText {
+		param(
+			[parameter(Mandatory = $false, HelpMessage = "Specify the path of the log file to read. An empty path returns nothing.")]
+			[string]$Path,
+			
+			[parameter(Mandatory = $false, HelpMessage = "Specify how many trailing lines to return.")]
+			[ValidateRange(1, 200)]
+			[int]$LineCount = 1
+		)
+		# Used for heartbeat and timeout output. Reading the tail of the DISM log is what turns "stuck at Apply Drivers" into
+		# "stuck on this INF", which is the difference between a guess and a diagnosis.
+		# Only the DISM calls have a progress log, so every other caller arrives here with an empty path. Rejecting it (5.6.2)
+		# made the first heartbeat of each download, pnputil, msiexec, expand and 7-Zip call throw, failing the step at 30 seconds.
+		if ([string]::IsNullOrEmpty($Path) -or (-not(Test-Path -Path $Path))) { return $null }
+		try {
+			$TailLines = @(Get-Content -Path $Path -Tail $LineCount -ErrorAction Stop | Where-Object { -not([string]::IsNullOrWhiteSpace($_)) })
+			if ($TailLines.Count -eq 0) { return $null }
+			return ($TailLines -join " | ")
+		}
+		catch { return $null }
+	}
+
+	function Clear-DriverPackageMount {
+		param(
+			[parameter(Mandatory = $false, HelpMessage = "Specify the mount path that may still hold a mounted WIM.")]
+			[string]$MountPath
+		)
+		# A killed DISM call or a failed injection can leave the WIM mounted. Discarding it here keeps the next phase, and the
+		# next build on this machine, from inheriting a dirty mount that makes Mount-WindowsImage fail.
+		if ([string]::IsNullOrEmpty($MountPath)) { return }
+		try {
+			if (-not(Test-Path -Path $MountPath)) { return }
+
+			$MountedImage = Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object { $_.MountPath -eq $MountPath }
+			if ($null -ne $MountedImage) {
+				Write-CMLogEntry -Value " - Discarding the mounted driver package WIM after a failed or interrupted phase: $($MountPath)" -Severity 2
+				Dismount-WindowsImage -Path $MountPath -Discard -ErrorAction Stop
+			}
+
+			Remove-Item -Path $MountPath -Recurse -Force -ErrorAction SilentlyContinue
+		}
+		catch [System.Exception] {
+			Write-CMLogEntry -Value " - WARNING: Unable to discard the mount at '$($MountPath)'. Error message: $($_.Exception.Message)" -Severity 2
+		}
+	}
+
 	function Invoke-Executable {
 		param(
 			[parameter(Mandatory = $true, HelpMessage = "Specify the file name or path of the executable to be invoked, including the extension")]
@@ -600,7 +803,21 @@ Process {
 			
 			[parameter(Mandatory = $false, HelpMessage = "Specify arguments that will be passed to the executable")]
 			[ValidateNotNull()]
-			[string]$Arguments
+			[string]$Arguments,
+
+			[parameter(Mandatory = $false, HelpMessage = "Specify a timeout in seconds. The process is terminated when the timeout expires. Zero uses the remaining runtime budget, or waits indefinitely when the budget is disabled.")]
+			[ValidateRange(0, 86400)]
+			[int]$TimeoutSeconds = 0,
+
+			[parameter(Mandatory = $false, HelpMessage = "Specify how often, in seconds, to log a heartbeat while the process runs. Zero disables heartbeats.")]
+			[ValidateRange(0, 600)]
+			[int]$HeartbeatSeconds = 30,
+
+			[parameter(Mandatory = $false, HelpMessage = "Specify a log file whose trailing line is written with each heartbeat, so a stalled call shows which driver it is on.")]
+			[string]$ProgressLogPath,
+
+			[parameter(Mandatory = $false, HelpMessage = "Specify a label for the operation, used in heartbeat and timeout messages.")]
+			[string]$Activity = $([System.IO.Path]::GetFileName($FilePath))
 		)
 		
 		# Construct a hash-table for default parameter splatting
@@ -615,15 +832,91 @@ Process {
 		if (-not([System.String]::IsNullOrEmpty($Arguments))) {
 			$SplatArgs.Add("ArgumentList", $Arguments)
 		}
+
+		# Resolve the effective limit once, so the heartbeat and the timeout agree with each other
+		$EffectiveTimeout = Get-RuntimeBudget -DesiredSeconds $TimeoutSeconds
+		if ($EffectiveTimeout -lt 0) {
+			Write-CMLogEntry -Value " - Runtime budget exhausted before '$($Activity)' could start" -Severity 3
+			throw [System.TimeoutException]::new("Runtime budget of $($Script:MaxRuntimeMinutes) minute(s) exhausted before '$($Activity)' could start")
+		}
 		
 		# Invoke executable and wait for process to exit
 		try {
 			$Invocation = Start-Process @SplatArgs
 			$Handle = $Invocation.Handle
-			$Invocation.WaitForExit()
+
+			if ($EffectiveTimeout -gt 0) {
+				Write-CMLogEntry -Value " - Waiting up to $($EffectiveTimeout) second(s) for '$($Activity)' to complete" -Severity 1
+			}
+			else {
+				Write-CMLogEntry -Value " - Waiting for '$($Activity)' to complete (no time limit configured)" -Severity 1
+			}
+
+			# Poll rather than blocking on WaitForExit(). A blocking wait is exactly how a wedged child process produced a task
+			# sequence that sat at "Apply Drivers" for hours with nothing in any log to show for it.
+			$WaitWatch = [System.Diagnostics.Stopwatch]::StartNew()
+			$NextHeartbeatSeconds = $HeartbeatSeconds
+			while ($true) {
+				if ($Invocation.WaitForExit(1000)) { break }
+
+				$ElapsedSeconds = $WaitWatch.Elapsed.TotalSeconds
+				if (($EffectiveTimeout -gt 0) -and ($ElapsedSeconds -ge $EffectiveTimeout)) {
+					# Report the last thing the child process wrote before it is killed: the trailing log line is the only evidence
+					# left once the process is gone
+					$TailText = Get-LogTailText -Path $ProgressLogPath -LineCount 20
+					if (-not([string]::IsNullOrEmpty($TailText))) {
+						Write-CMLogEntry -Value " - Last 20 line(s) of '$($ProgressLogPath)' at the point of timeout:" -Severity 3
+						# -split rather than .Split(" | "): Windows PowerShell 5.1 has no Split(string) overload, so the separator is treated
+						# as a set of characters and every space and pipe became a separate log line
+						foreach ($TailLine in @($TailText -split ' \| ')) {
+							Write-CMLogEntry -Value "   * $($TailLine.Trim())" -Severity 3
+						}
+					}
+
+					try {
+						$Invocation.Kill()
+						$Invocation.WaitForExit(30000) | Out-Null
+					}
+					catch [System.Exception] {
+						Write-CMLogEntry -Value " - WARNING: Unable to terminate timed out process '$($FilePath)'. Error message: $($_.Exception.Message)" -Severity 2
+					}
+
+					Write-CMLogEntry -Value " - '$($Activity)' did not complete within $($EffectiveTimeout) second(s) and was terminated" -Severity 3
+					Write-Host "ApplyDriverPackage: TIMEOUT - '$($Activity)' was terminated after $($EffectiveTimeout) second(s)"
+
+					throw [System.TimeoutException]::new("'$($Activity)' timed out after $($EffectiveTimeout) second(s)")
+				}
+
+				if (($HeartbeatSeconds -gt 0) -and ($ElapsedSeconds -ge $NextHeartbeatSeconds)) {
+					# A heartbeat proves the step is alive, which is what was missing when these builds were reported as hung
+					$NextHeartbeatSeconds = $ElapsedSeconds + $HeartbeatSeconds
+
+					# The heartbeat is diagnostics only. It must never be the reason the process it reports on is abandoned, which is how
+					# 5.6.2 failed every download at 30 seconds, so a heartbeat that cannot be written costs a warning and nothing more
+					try {
+						$HeartbeatText = " - Still running: '$($Activity)' after $([math]::Round($ElapsedSeconds)) second(s)"
+						$TailLine = Get-LogTailText -Path $ProgressLogPath -LineCount 1
+						if (-not([string]::IsNullOrEmpty($TailLine))) {
+							if ($TailLine.Length -gt 220) { $TailLine = $TailLine.Substring(0, 220) + "..." }
+							$HeartbeatText = "$($HeartbeatText) | last entry: $($TailLine)"
+						}
+						Write-CMLogEntry -Value $HeartbeatText -Severity 1
+					}
+					catch [System.Exception] {
+						Write-CMLogEntry -Value " - WARNING: Unable to write heartbeat for '$($Activity)'. Error message: $($_.Exception.Message)" -Severity 2
+					}
+				}
+			}
 		}
 		catch [System.Exception] {
-			Write-Warning -Message $_.Exception.Message; break
+			Write-Warning -Message $_.Exception.Message
+			Write-CMLogEntry -Value " - An error occurred while running '$($Activity)'. Error message: $($_.Exception.Message)" -Severity 3
+
+			# Every error goes back to the caller, timeouts included. The break that used to be here is not scoped to this
+			# function: outside a loop it leaves through the nearest loop or switch further up the call stack, or quietly ends
+			# the script when there is none. That skipped the download error handling (the blank "unhandled exit code"), and in
+			# DriverUpdate mode left the pnputil branch early so the registry stamp was written for an unfinished install.
+			throw
 		}
 		
 		return $Invocation.ExitCode
@@ -670,22 +963,38 @@ Process {
 			$TSEnvironment.Value("OSDDownloadDestinationPath") = "$($CustomLocationPath)"
 		}
 		
-		# Set SMSTSDownloadRetryCount to 1000 to overcome potential BranchCache issue that will cause 'SendWinHttpRequest failed. 80072efe'
-		$TSEnvironment.Value("SMSTSDownloadRetryCount") = 1000
+		# Bounded retry. 20 attempts at a 10 second delay covers a slow DP or a transient BranchCache miss ('SendWinHttpRequest
+		# failed. 80072efe'), while a misdirected boundary group or an unreachable DP now gives up in roughly 3 minutes. The
+		# previous value of 1000 inherited from the upstream script, combined with the 15 second default retry delay, allowed
+		# about 4 hours of retrying with nothing written to any log - the reported hang at the Apply Drivers step.
+		Write-CMLogEntry -Value " - Setting SMSTSDownloadRetryCount to 20 and SMSTSDownloadRetryDelay to 10 second(s)" -Severity 1
+		$TSEnvironment.Value("SMSTSDownloadRetryCount") = 20
+		$TSEnvironment.Value("SMSTSDownloadRetryDelay") = 10
 		
+		# Bound the download so a stalled or unreachable DP fails the step instead of hanging the task sequence. The download is
+		# also capped by whatever is left of the runtime budget, so one phase cannot consume the whole allowance.
+		$DownloadTimeoutSeconds = $DownloadTimeoutMinutes * 60
+		$Script:CurrentPhase = "download of package $($PackageID)"
+		if ($Script:MaxRuntimeMinutes -gt 0) {
+			$DownloadTimeoutSeconds = Get-RuntimeBudget -DesiredSeconds $DownloadTimeoutSeconds
+			if ($DownloadTimeoutSeconds -lt 0) { $DownloadTimeoutSeconds = 1 }
+		}
+		Write-CMLogEntry -Value " - Package content download will be abandoned after $($DownloadTimeoutSeconds) second(s)" -Severity 1
+
 		# Invoke download of package content
 		try {
 			if ($TSEnvironment.Value("_SMSTSInWinPE") -eq $false) {
 				Write-CMLogEntry -Value " - Starting package content download process (FullOS), this might take some time" -Severity 1
-				$ReturnCode = Invoke-Executable -FilePath (Join-Path -Path $env:windir -ChildPath "CCM\OSDDownloadContent.exe")
+				$ReturnCode = Invoke-Executable -FilePath (Join-Path -Path $env:windir -ChildPath "CCM\OSDDownloadContent.exe") -TimeoutSeconds $DownloadTimeoutSeconds -Activity "OSDDownloadContent.exe (package $($PackageID))"
 			}
 			else {
 				Write-CMLogEntry -Value " - Starting package content download process (WinPE), this might take some time" -Severity 1
-				$ReturnCode = Invoke-Executable -FilePath "OSDDownloadContent.exe"
+				$ReturnCode = Invoke-Executable -FilePath "OSDDownloadContent.exe" -TimeoutSeconds $DownloadTimeoutSeconds -Activity "OSDDownloadContent.exe (package $($PackageID))"
 			}
 			
-			# Reset SMSTSDownloadRetryCount to 5 after attempted download
+			# Reset SMSTSDownloadRetryCount and SMSTSDownloadRetryDelay after attempted download
 			$TSEnvironment.Value("SMSTSDownloadRetryCount") = 5
+			$TSEnvironment.Value("SMSTSDownloadRetryDelay") = 15
 			
 			# Match on return code
 			if ($ReturnCode -eq 0) {
@@ -1340,14 +1649,8 @@ Process {
 			FallbackSKU  = $null
 		}
 
-		# Cache CIM queries globally to avoid redundant calls across helper functions
-		if ($null -eq $Script:CachedWin32CS) {
-			$Script:CachedWin32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
-		}
-		if ($null -eq $Script:CachedWin32OS) {
-			$Script:CachedWin32OS = Get-CimInstance -ClassName "Win32_OperatingSystem"
-		}
-		$Win32CS = $Script:CachedWin32CS
+		# Cache CIM queries to avoid redundant calls (performance improvement)
+		$Win32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
 		$Win32CSP = Get-CimInstance -ClassName "Win32_ComputerSystemProduct"
 		$MSSystemInfo = Get-CimInstance -ClassName "MS_SystemInformation" -Namespace "root\WMI"
 
@@ -1434,10 +1737,7 @@ Process {
 	}
 	
 	function Get-ComputerSystemType {
-		if ($null -eq $Script:CachedWin32CS) {
-			$Script:CachedWin32CS = Get-CimInstance -ClassName "Win32_ComputerSystem"
-		}
-		$ComputerSystemType = $Script:CachedWin32CS.Model
+		$ComputerSystemType = Get-CimInstance -ClassName "Win32_ComputerSystem" | Select-Object -ExpandProperty "Model"
 		if ($ComputerSystemType -notin @("Virtual Machine", "VMware Virtual Platform", "VirtualBox", "HVM domU", "KVM", "VMWare7,1")) {
 			Write-CMLogEntry -Value " - Supported computer platform detected, script execution allowed to continue" -Severity 1
 		}
@@ -1459,10 +1759,7 @@ Process {
 	
 	function Get-OperatingSystemVersion {
 		if (($Script:PSCmdlet.ParameterSetName -like "DriverUpdate") -or ($Script:PSCmdlet.ParameterSetName -like "OSUpgrade")) {
-			if ($null -eq $Script:CachedWin32OS) {
-				$Script:CachedWin32OS = Get-CimInstance -ClassName "Win32_OperatingSystem"
-			}
-			$OperatingSystemVersion = $Script:CachedWin32OS.Version
+			$OperatingSystemVersion = Get-CimInstance -ClassName "Win32_OperatingSystem" | Select-Object -ExpandProperty "Version"
 			if ($OperatingSystemVersion -like "10.0.*") {
 				Write-CMLogEntry -Value " - Supported operating system version currently running detected, script execution allowed to continue" -Severity 1
 			}
@@ -2571,27 +2868,237 @@ Process {
 			[ValidateNotNullOrEmpty()]
 			[string]$Path
 		)
-		# Detects INF files that are incompatible with offline DISM injection in WinPE:
-		# 1. Firmware update packages (Class=Firmware / {f2e7dd72-6468-4e36-b6f1-6488f42c1b52})
-		# 2. DCH extension wrappers (Class=Extension / {e2f84ce7-8efa-411c-aa69-97454ca4cb57})
-		# 3. DCH software components (Class=SoftwareComponent / {5c4c3332-e396-48d5-b584-290b5030f2f0})
-		# These components require online AppX/WinRT staging and fail offline with DISM code 2 (0x80070002).
-		# Returns $true when the INF should be safely skipped during offline injection.
+		# Surface driver/firmware packages include firmware update components whose INF files declare the Firmware
+		# setup class (Class=Firmware / ClassGuid {f2e7dd72-6468-4e36-b6f1-6488f42c1b52}). These cannot be injected
+		# into an offline image with DISM /Add-Driver and previously caused driver application to error out, so they
+		# must be skipped. Returns $true when the INF is a firmware update package.
 		try {
 			$InfContent = Get-Content -Path $Path -Raw -ErrorAction Stop
-			if ($InfContent -match "(?im)^\s*Class\s*=\s*Firmware\b") { return $true }
-			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") { return $true }
-			if ($InfContent -match "(?im)^\s*Class\s*=\s*Extension\b") { return $true }
-			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?e2f84ce7-8efa-411c-aa69-97454ca4cb57\}?") { return $true }
-			if ($InfContent -match "(?im)^\s*Class\s*=\s*SoftwareComponent\b") { return $true }
-			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?5c4c3332-e396-48d5-b584-290b5030f2f0\}?") { return $true }
-			if ($Path -match "(?i)_dch\.inf$") { return $true }
+			if ($InfContent -match "(?im)^\s*Class\s*=\s*Firmware\b") {
+				return $true
+			}
+			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") {
+				return $true
+			}
 			return $false
 		}
 		catch [System.Exception] {
-			Write-CMLogEntry -Value " - WARNING: Unable to read INF for offline compatibility classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
+			# If the INF cannot be read, do not treat it as firmware so normal injection still attempts it
+			Write-CMLogEntry -Value " - WARNING: Unable to read INF for firmware classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
 			return $false
 		}
+	}
+
+	function Get-NonInjectableDriverInfReason {
+		param (
+			[parameter(Mandatory = $true, HelpMessage = "Specify the full path to the driver INF file to inspect.")]
+			[ValidateNotNullOrEmpty()]
+			[string]$Path,
+
+			[parameter(Mandatory = $false, HelpMessage = "Include the SoftwareComponent and Extension setup classes. Use for offline injection only: an online pnputil install can apply those normally.")]
+			[switch]$IncludeComponentClasses
+		)
+		# Returns the setup class that makes an INF unusable for injection, or $null when the INF can be injected.
+		# Firmware INFs are rejected by DISM /Add-Driver; SoftwareComponent and Extension INFs (Intel DTT, Intel IPF,
+		# Intel ME LMS/WMI provider, Realtek and Waves APOs, Intel graphics components) also cannot be applied to an
+		# offline image and only produce "the driver package could not be installed" noise in the log. Those component
+		# classes do install on a running OS, so they are only excluded with -IncludeComponentClasses.
+		$SetupClasses = @("Firmware")
+		if ($IncludeComponentClasses) {
+			$SetupClasses += @("SoftwareComponent", "Extension")
+		}
+		try {
+			$InfContent = Get-Content -Path $Path -Raw -ErrorAction Stop
+			foreach ($SetupClass in $SetupClasses) {
+				if ($InfContent -match "(?im)^\s*Class\s*=\s*$($SetupClass)\b") {
+					return $SetupClass
+				}
+			}
+			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") {
+				return "Firmware"
+			}
+			return $null
+		}
+		catch [System.Exception] {
+			# If the INF cannot be read, do not classify it: normal injection should still attempt it
+			Write-CMLogEntry -Value " - WARNING: Unable to read INF for setup class classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
+			return $null
+		}
+	}
+
+	function Set-DriverContentExclusion {
+		param (
+			[parameter(Mandatory = $true, HelpMessage = "Specify the path holding the driver content that will be injected.")]
+			[ValidateNotNullOrEmpty()]
+			[string]$Path,
+
+			[parameter(Mandatory = $false, HelpMessage = "Set to True when the content path can be renamed (a writable copy rather than a read-only mount).")]
+			[bool]$Writable = $true,
+
+			[parameter(Mandatory = $false, HelpMessage = "Also exclude the SoftwareComponent and Extension setup classes. Correct for offline DISM injection, wrong for an online pnputil install.")]
+			[switch]$IncludeComponentClasses
+		)
+		$ExcludedCount = 0
+		$ReadOnlyCount = 0
+		$FailedCount = 0
+		$ReadOnlyClasses = @{}
+		$ContentINFs = Get-ChildItem -Path $Path -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue
+		Write-CMLogEntry -Value " - Scanning $((@($ContentINFs)).Count) INF file(s) for setup classes that cannot be injected" -Severity 1
+
+		foreach ($ContentINF in $ContentINFs) {
+			$Reason = Get-NonInjectableDriverInfReason -Path $ContentINF.FullName -IncludeComponentClasses:$IncludeComponentClasses
+			if ([string]::IsNullOrEmpty($Reason)) { continue }
+
+			if (-not $Writable) {
+				# Read-only source (mounted WIM): nothing to rename. DISM will report these as skipped and
+				# Write-DismInjectionSummary classifies them as expected rather than as driver failures. Counted by
+				# setup class and reported once: a Latitude 5530 package holds 61 of them, which used to print 61 lines.
+				$ReadOnlyCount++
+				if ($ReadOnlyClasses.ContainsKey($Reason)) { $ReadOnlyClasses[$Reason]++ } else { $ReadOnlyClasses[$Reason] = 1 }
+				continue
+			}
+
+			try {
+				Write-CMLogEntry -Value " - Excluding non-injectable $($Reason) INF from driver injection: $($ContentINF.FullName)" -Severity 1
+				Rename-Item -Path $ContentINF.FullName -NewName "$($ContentINF.Name).$($Reason.ToLower()).skipped" -Force -ErrorAction Stop
+				$ExcludedCount++
+			}
+			catch [System.Exception] {
+				# Per file error handling: one locked or read-only INF previously aborted the whole exclusion pass,
+				# which is how a Surface package could end up with no exclusion at all
+				$FailedCount++
+				Write-CMLogEntry -Value " - WARNING: Unable to exclude INF '$($ContentINF.FullName)'. Error message: $($_.Exception.Message)" -Severity 2
+			}
+		}
+
+		if ($ReadOnlyCount -gt 0) {
+			$ClassSummary = (($ReadOnlyClasses.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Value) $($_.Name)" }) -join ", ")
+			Write-CMLogEntry -Value " - $($ReadOnlyCount) non-injectable INF(s) left in place on the read-only source ($($ClassSummary)): DISM skips them and they are reported as expected" -Severity 1
+		}
+
+		Write-CMLogEntry -Value " - Driver INF exclusion summary: $($ExcludedCount) excluded, $($ReadOnlyCount) left for DISM to skip, $($FailedCount) failed to exclude" -Severity 1
+		if ($ExcludedCount -gt 0) {
+			Write-Host "ApplyDriverPackage: Excluded $($ExcludedCount) non-injectable INF(s) from driver injection"
+		}
+	}
+
+	function Write-DismInjectionSummary {
+		param (
+			[parameter(Mandatory = $true, HelpMessage = "Specify the exit code returned by dism.exe.")]
+			[int]$ExitCode,
+
+			[parameter(Mandatory = $true, HelpMessage = "Specify the full path to the DISM log written by the injection run.")]
+			[ValidateNotNullOrEmpty()]
+			[string]$LogPath,
+
+			[parameter(Mandatory = $false, HelpMessage = "Specify the path the drivers were injected from, used to ignore log entries from other DISM runs.")]
+			[string]$SourcePath
+		)
+		# DISM never names the INF it failed on in its console summary, so the log is the only place the names exist.
+		# Failures are worked out by comparing the INFs found under the injection source against the ones DISM reports as
+		# successfully processed, with error lines used as a cross check. The results are then split into expected
+		# (setup classes that cannot be injected offline) and significant (real hardware drivers) so that one genuine
+		# storage, network or display driver failure stays visible instead of drowning in the sixteen or so component
+		# INFs that every modern Dell or Lenovo package also contains.
+		$FailedINFs = [System.Collections.Generic.List[string]]::new()
+		$ProcessedINFs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+		$ErrorCodes = @{}
+
+		if (Test-Path -Path $LogPath) {
+			foreach ($DismLine in (Get-Content -Path $LogPath -ErrorAction SilentlyContinue)) {
+				# DISM spells this "proccessed". The optional extra c tolerates a future correction of that typo.
+				# IgnoreCase is not optional: DISM logs the file name as it exists on disk, so a lowercase-only pattern
+				# silently drops every *.INF entry (Netwtw08.INF, Netwtw6e.INF, rtu52cx22x64sta.INF, WavesDMIC_AGC.INF),
+				# and those INFs then look unprocessed and get reported as failed injections that in fact succeeded.
+				$ProcessedMatch = [regex]::Match($DismLine, "Successfully\s+procc?essed\s+driver package\s+'([^']+\.inf)'", "IgnoreCase")
+				if ($ProcessedMatch.Success) {
+					[void]$ProcessedINFs.Add($ProcessedMatch.Groups[1].Value)
+					continue
+				}
+
+				if ($DismLine -match ", Error\s" -or $DismLine -match "^\s*Error\s") {
+					$InfMatch = [regex]::Match($DismLine, '([A-Za-z]:\\[^"'']*?\.inf)', "IgnoreCase")
+					if ($InfMatch.Success) {
+						$FailedINFs.Add($InfMatch.Groups[1].Value)
+
+						# The log carries the setupapi result on the same line; keep it so the report says why, not just which
+						$CodeMatch = [regex]::Match($DismLine, "(?:hr[=:])?(0x8[0-9A-Fa-f]{7})")
+						if (($CodeMatch.Success) -and (-not($ErrorCodes.ContainsKey($InfMatch.Groups[1].Value.ToLower())))) {
+							$ErrorCodes[$InfMatch.Groups[1].Value.ToLower()] = $CodeMatch.Groups[1].Value
+						}
+					}
+				}
+			}
+			Write-CMLogEntry -Value " - DISM log '$($LogPath)': $($ProcessedINFs.Count) driver package(s) processed, $($FailedINFs.Count) error line(s) referencing an INF" -Severity 1
+		}
+		else {
+			Write-CMLogEntry -Value " - WARNING: DISM log not found at '$($LogPath)', INF-level failures cannot be identified" -Severity 2
+		}
+
+		# Anything under the injection source that DISM never reported as processed also failed to inject. Only trust this
+		# comparison when the log actually contains processed entries: an empty or rotated log would otherwise make every
+		# driver in the package look like a failure.
+		if (($ProcessedINFs.Count -gt 0) -and (-not([string]::IsNullOrEmpty($SourcePath))) -and (Test-Path -Path $SourcePath)) {
+			$SourceINFs = Get-ChildItem -Path $SourcePath -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue
+			foreach ($SourceINF in $SourceINFs) {
+				if (-not($ProcessedINFs.Contains($SourceINF.FullName))) {
+					$FailedINFs.Add($SourceINF.FullName)
+				}
+			}
+		}
+
+		$ExpectedFailures = [System.Collections.Generic.List[string]]::new()
+		$SignificantFailures = [System.Collections.Generic.List[string]]::new()
+		$SeenINFs = [System.Collections.Generic.List[string]]::new()
+
+		foreach ($FailedINF in $FailedINFs) {
+			# Ignore log entries from other DISM runs (the native Apply Driver Package step writes to the same log)
+			if (-not([string]::IsNullOrEmpty($SourcePath)) -and (-not($FailedINF.StartsWith($SourcePath, [System.StringComparison]::OrdinalIgnoreCase)))) {
+				continue
+			}
+			if ($SeenINFs.Contains($FailedINF.ToLower())) { continue }
+			$SeenINFs.Add($FailedINF.ToLower())
+
+			$Reason = $null
+			if (Test-Path -Path $FailedINF) {
+				$Reason = Get-NonInjectableDriverInfReason -Path $FailedINF -IncludeComponentClasses
+			}
+
+			if ([string]::IsNullOrEmpty($Reason)) {
+				# Name the setupapi result where the log carried one: "could not be installed" alone is not diagnosable
+				if ($ErrorCodes.ContainsKey($FailedINF.ToLower())) {
+					$SignificantFailures.Add("$($FailedINF) [$($ErrorCodes[$FailedINF.ToLower()])]")
+				}
+				else {
+					$SignificantFailures.Add($FailedINF)
+				}
+			}
+			else {
+				$ExpectedFailures.Add("$($FailedINF) [$($Reason)]")
+			}
+		}
+
+		if ($ExpectedFailures.Count -gt 0) {
+			Write-CMLogEntry -Value " - $($ExpectedFailures.Count) INF(s) not injected, all of a setup class that cannot be applied offline (expected, no action required):" -Severity 1
+			foreach ($Item in $ExpectedFailures) { Write-CMLogEntry -Value "   * $($Item)" -Severity 1 }
+		}
+
+		if ($SignificantFailures.Count -gt 0) {
+			Write-CMLogEntry -Value " - $($SignificantFailures.Count) injectable driver INF(s) failed to inject:" -Severity 2
+			foreach ($Item in $SignificantFailures) { Write-CMLogEntry -Value "   * $($Item)" -Severity 2 }
+			Write-CMLogEntry -Value " - INF-level detail: '$($LogPath)'. Per-device detail: C:\Windows\INF\setupapi.offline.log in the target image" -Severity 2
+			Write-Host "ApplyDriverPackage: WARNING - $($SignificantFailures.Count) driver INF(s) failed to inject: $($SignificantFailures -join ', ')"
+
+			if ($Script:FailOnDriverInjectionError) {
+				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "$($SignificantFailures.Count) driver INF(s) failed to inject: $($SignificantFailures -join ', '). See '$($LogPath)' and C:\Windows\INF\setupapi.offline.log for detail."))
+			}
+		}
+		elseif ($ExitCode -ne 0) {
+			Write-CMLogEntry -Value " - DISM returned $($ExitCode) but no injectable driver failed: every remaining failure is a component or firmware INF that cannot be applied to an offline image" -Severity 1
+			Write-Host "ApplyDriverPackage: DISM returned $($ExitCode) - only non-injectable component/firmware INFs failed, no action required"
+		}
+
+		return $SignificantFailures
 	}
 
 	function Install-DriverPackageContent {
@@ -2600,6 +3107,22 @@ Process {
 			[ValidateNotNullOrEmpty()]
 			[string]$ContentLocation
 		)
+
+		# Drivers are injected from this path. For zip/exe/cab/MSI sources it is the extracted content folder; for a WIM source
+		# it is the read-only mount, unless the package needs a writable copy (see the *.wim case below).
+		$Script:DriverInjectionPath = $ContentLocation
+
+		# DISM writes INF-level detail to this log. Without /LogPath the detail lands in X:\Windows\Logs\DISM\dism.log, which is
+		# never harvested with the task sequence logs, leaving a bare "the driver package could not be installed" in smsts.log.
+		# The file name is deliberately not dism.log: the native Apply Driver Package step writes to X:\Windows\TEMP\SMSTSLog\dism.log
+		# in the same WinPE session, and appending two runs to one file mixes their "processed" entries together.
+		$Script:DismLogPath = Join-Path -Path $env:windir -ChildPath "TEMP\SMSTSLog\dism-ApplyDriverPackage.log"
+		if (-not (Test-Path -Path (Split-Path -Path $Script:DismLogPath -Parent))) {
+			$Script:DismLogPath = Join-Path -Path $env:windir -ChildPath "Logs\DISM\dism.log"
+		}
+
+		$Script:CurrentPhase = "driver package content preparation ($($ContentLocation))"
+		Assert-RuntimeBudget -Phase "content preparation"
 
 		# Detect if downloaded driver package content contains a Microsoft Surface MSI package that needs extraction
 		$DriverPackageMSIFile = Get-ChildItem -Path $ContentLocation -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -2721,72 +3244,105 @@ Process {
 					}
 				}
 				"*.wim" {
-					$DriverPackageMountLocation = Join-Path -Path $ContentLocation -ChildPath "Mount"
 					try {
+						# Create mount location for the driver package WIM file. This has to live OUTSIDE the content folder: when the
+						# mount sits inside $ContentLocation, DISM /Recurse walks the mounted tree and the copy of it made below, and
+						# injects every driver twice (a 255 INF Dell package becomes 510 install operations, ~40 seconds of wasted work).
+						$DriverPackageMountLocation = Join-Path -Path (Split-Path -Path $ContentLocation -Parent) -ChildPath ("Mount-" + (Split-Path -Path $ContentLocation -Leaf))
 						if (-not (Test-Path -Path $DriverPackageMountLocation)) {
 							Write-CMLogEntry -Value " - Creating mount location directory: $($DriverPackageMountLocation)" -Severity 1
 							New-Item -Path $DriverPackageMountLocation -ItemType "Directory" -Force | Out-Null
 						}
+						elseif ($null -ne (Get-ChildItem -Path $DriverPackageMountLocation -Force -ErrorAction SilentlyContinue)) {
+							# Left behind by an interrupted build and possibly still mounted: a dirty mount folder makes
+							# Mount-WindowsImage fail, so discard and recreate it
+							Write-CMLogEntry -Value " - Mount location exists and is not empty, clearing before mount: $($DriverPackageMountLocation)" -Severity 2
+							Dismount-WindowsImage -Path $DriverPackageMountLocation -Discard -ErrorAction SilentlyContinue
+							Remove-Item -Path $DriverPackageMountLocation -Recurse -Force -ErrorAction SilentlyContinue
+							New-Item -Path $DriverPackageMountLocation -ItemType "Directory" -Force | Out-Null
+						}
+					}
+					catch [System.Exception] {
+						Write-CMLogEntry -Value " - Failed to create mount location for WIM file. Error message: $($_.Exception.Message)" -Severity 3
+						
+						# Throw terminating error						
+						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					}
+					
+					$Script:CurrentPhase = "mounting the driver package WIM"
+					Assert-RuntimeBudget -Phase "mounting the driver package WIM"
 
+					$WIMMounted = $false
+					try {
+						# Expand compressed driver package WIM file
 						Write-CMLogEntry -Value " - Attempting to mount driver package content WIM file: $($DriverPackageCompressedFile.Name)" -Severity 1
 						Write-CMLogEntry -Value " - Mount location: $($DriverPackageMountLocation)" -Severity 1
 						Mount-WindowsImage -ImagePath $DriverPackageCompressedFile.FullName -Path $DriverPackageMountLocation -Index 1 -ErrorAction Stop
+						$WIMMounted = $true
 						Write-CMLogEntry -Value " - Successfully mounted driver package content WIM file" -Severity 1
-						Write-CMLogEntry -Value " - Copying items from mount directory to driver content directory" -Severity 1
-						Get-ChildItem -Path $DriverPackageMountLocation | Copy-Item -Destination $ContentLocation -Recurse -Container
-						Write-CMLogEntry -Value " - Successfully extracted driver package WIM content" -Severity 1
+
+						# The mounted content is copied to local disk before injection. Injecting straight from the mount looked cheaper
+						# because it drops the copy, but DISM then reads every payload file through WIM decompression: on a Latitude 5530
+						# package that doubled INF enumeration (25 s against 14 s) and made the graphics package take 43.6 s instead of
+						# 8.9-11.4 s from a local copy, which more than paid back the copy it saved. The writable copy is also what lets
+						# the non-injectable INF exclusion rename files out of the *.inf pattern. -InjectFromMount restores the old
+						# read-only-mount behaviour for anyone who wants to measure it on their own packages.
+						$CopyMountToContent = -not $Script:InjectFromMount
+
+						if ($CopyMountToContent) {
+							$Script:CurrentPhase = "copying the mounted WIM to local disk"
+							Assert-RuntimeBudget -Phase "copying the mounted WIM to local disk"
+							Write-CMLogEntry -Value " - Copying items from mount directory (writable copy required for INF exclusion)" -Severity 1
+							$CopyStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+							Get-ChildItem -Path $DriverPackageMountLocation | Copy-Item -Destination $ContentLocation -Recurse -Container -ErrorAction Stop
+							$CopyStopwatch.Stop()
+							Write-CMLogEntry -Value " - Successfully copied mounted content in $([math]::Round($CopyStopwatch.Elapsed.TotalSeconds, 1)) second(s)" -Severity 1
+							$Script:DriverInjectionPath = $ContentLocation
+						}
+						else {
+							Write-CMLogEntry -Value " - Injecting drivers directly from the mounted WIM, copy step skipped for $($ComputerData.Manufacturer) package" -Severity 1
+							$Script:DriverInjectionPath = $DriverPackageMountLocation
+						}
+
+						Write-Output "ApplyDriverPackage: Driver injection source: $($Script:DriverInjectionPath)"
 					}
 					catch [System.Exception] {
 						Write-CMLogEntry -Value " - Failed to mount or copy driver package content WIM file. Error message: $($_.Exception.Message)" -Severity 3
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
-					}
-					finally {
-						# Dismount WIM and cleanup Mount directory immediately so DISM won't scan duplicate drivers
-						try {
-							Write-CMLogEntry -Value " - Dismounting driver package content WIM file and cleaning up mount folder" -Severity 1
-							Dismount-WindowsImage -Path $DriverPackageMountLocation -Discard -ErrorAction SilentlyContinue
-							if (Test-Path -Path $DriverPackageMountLocation) {
-								Remove-Item -Path $DriverPackageMountLocation -Force -Recurse -ErrorAction SilentlyContinue
+
+						# Attempt to dismount WIM on error to prevent dangling mounts
+						if ($WIMMounted) {
+							try {
+								Write-CMLogEntry -Value " - Attempting emergency dismount of WIM file after error" -Severity 2
+								Dismount-WindowsImage -Path $DriverPackageMountLocation -Discard -ErrorAction Stop
+								Write-CMLogEntry -Value " - Successfully dismounted WIM file during error cleanup" -Severity 2
 							}
-							Write-CMLogEntry -Value " - Successfully dismounted WIM and removed mount folder" -Severity 1
+							catch [System.Exception] {
+								Write-CMLogEntry -Value " - Failed to dismount WIM file during error cleanup. Error message: $($_.Exception.Message)" -Severity 2
+							}
 						}
-						catch [System.Exception] {
-							Write-CMLogEntry -Value " - WARNING: An error occurred while cleaning up WIM mount directory: $($_.Exception.Message)" -Severity 2
-						}
+
+						# Throw terminating error
+						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
 					}
 				}
 			}
 		}
 		
-		# Skip firmware update INFs (e.g. Microsoft Surface firmware components) before applying drivers. These declare
-		# the Firmware setup class and cannot be injected into an offline image with DISM /Add-Driver, and would also be
-		# picked up by pnputil during DriverUpdate. Renaming them out of the "*.inf" pattern excludes them from every
-		# injection method (DISM /Recurse, per-INF DISM, and pnputil /subdirs) without deleting any content.
-		try {
-			$ContentINFs = Get-ChildItem -Path $ContentLocation -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue
-			$FirmwareINFCount = 0
-			foreach ($ContentINF in $ContentINFs) {
-				if (Test-FirmwareDriverInf -Path $ContentINF.FullName) {
-					Write-CMLogEntry -Value " - Skipping firmware INF (excluded from driver injection): $($ContentINF.FullName)" -Severity 1
-					Rename-Item -Path $ContentINF.FullName -NewName "$($ContentINF.Name).firmware_skipped" -Force -ErrorAction Stop
-					$FirmwareINFCount++
-				}
-			}
-			if ($FirmwareINFCount -gt 0) {
-				Write-CMLogEntry -Value " - Excluded $($FirmwareINFCount) firmware INF file(s) from driver injection" -Severity 1
-			}
-			else {
-				Write-CMLogEntry -Value " - No firmware INF files detected in driver package content" -Severity 1
-			}
-		}
-		catch [System.Exception] {
-			Write-CMLogEntry -Value " - WARNING: An error occurred while excluding firmware INF files. Error message: $($_.Exception.Message)" -Severity 2
-		}
+		# Exclude driver INFs that cannot be injected. Firmware INFs (e.g. Microsoft Surface firmware components) and the
+		# SoftwareComponent/Extension setup classes cannot be applied to an offline image with DISM /Add-Driver, and firmware
+		# INFs are also picked up by pnputil during DriverUpdate. Renaming them out of the "*.inf" pattern excludes them from
+		# every injection method (DISM /Recurse, per-INF DISM and pnputil /subdirs) without deleting any content. When the
+		# injection source is a read-only mount there is nothing to rename, so the INFs are logged and DISM reports them as
+		# skipped, which Write-DismInjectionSummary then classifies as expected.
+		# Component classes are only excluded for offline DISM injection; an online pnputil install can apply them normally
+		$InjectionSourceIsWritable = ($Script:DriverInjectionPath -eq $ContentLocation)
+		$OfflineInjection = ($Script:DeploymentMode -eq "BareMetal")
+		Set-DriverContentExclusion -Path $Script:DriverInjectionPath -Writable $InjectionSourceIsWritable -IncludeComponentClasses:$OfflineInjection
 
 		switch ($Script:DeploymentMode) {
 			"BareMetal" {
 				# Apply drivers recursively from downloaded driver package location
-				Write-CMLogEntry -Value " - Attempting to apply drivers using dism.exe located in: $($ContentLocation)" -Severity 1
+				Write-CMLogEntry -Value " - Attempting to apply drivers using dism.exe, injection source: $($Script:DriverInjectionPath)" -Severity 1
 				
 				# Ensure scratch directory exists on target OS drive for DISM temporary expansion
 				$ScratchDir = "$($TSEnvironment.Value('OSDTargetSystemDrive'))\Windows\Temp"
@@ -2801,31 +3357,57 @@ Process {
 							Write-CMLogEntry -Value " - DriverInstallMode is currently set to: $($DriverInstallMode)" -Severity 1
 							
 							# Get driver full path and install each driver seperately
-							$DriverINFs = Get-ChildItem -Path $ContentLocation -Recurse -Filter "*.inf" -ErrorAction Stop | Select-Object -Property FullName, Name
+							$DriverINFs = Get-ChildItem -Path $Script:DriverInjectionPath -Recurse -Filter "*.inf" -ErrorAction Stop | Select-Object -Property FullName, Name
 							if ($null -ne $DriverINFs) {
+								$SingleSuccessCount = 0
+								$SingleExpectedCount = 0
+								$SingleSignificantFailures = [System.Collections.Generic.List[string]]::new()
+
 								foreach ($DriverINF in $DriverINFs) {
 									# Install specific driver
 									Write-CMLogEntry -Value " - Attempting to install driver: $($DriverINF.FullName)" -Severity 1
-									$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:`"$($DriverINF.FullName)`" /ForceUnsigned /ScratchDir:`"$ScratchDir`""
-									
+									$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:`"$($DriverINF.FullName)`" /ForceUnsigned /ScratchDir:`"$ScratchDir`" /LogPath:`"$($Script:DismLogPath)`"" -ProgressLogPath $Script:DismLogPath -Activity "dism.exe /Add-Driver ($($DriverINF.Name))"
+
 									# Validate driver injection
 									if ($ApplyDriverInvocation -eq 0) {
+										$SingleSuccessCount++
 										Write-CMLogEntry -Value " - Successfully installed driver using dism.exe" -Severity 1
 									}
 									else {
-										Write-CMLogEntry -Value " - An error occurred while installing driver. Continuing with warning code: $($ApplyDriverInvocation). See DISM.log for more details" -Severity 2
+										# Expected for setup classes that cannot be applied offline; significant otherwise
+										$SingleReason = Get-NonInjectableDriverInfReason -Path $DriverINF.FullName -IncludeComponentClasses
+										if ([string]::IsNullOrEmpty($SingleReason)) {
+											$SingleSignificantFailures.Add($DriverINF.FullName)
+											Write-CMLogEntry -Value " - An error occurred while installing driver. Continuing with warning code: $($ApplyDriverInvocation). See DISM.log for more details" -Severity 2
+										}
+										else {
+											$SingleExpectedCount++
+											Write-CMLogEntry -Value " - Skipped $($SingleReason) INF, this setup class cannot be applied to an offline image (expected)" -Severity 1
+										}
+									}
+								}
+
+								Write-CMLogEntry -Value " - Driver injection summary: $($SingleSuccessCount) installed, $($SingleExpectedCount) skipped as non-injectable, $($SingleSignificantFailures.Count) failed" -Severity 1
+								if ($SingleSignificantFailures.Count -gt 0) {
+									Write-CMLogEntry -Value " - $($SingleSignificantFailures.Count) injectable driver INF(s) failed to inject:" -Severity 2
+									foreach ($SingleFailure in $SingleSignificantFailures) { Write-CMLogEntry -Value "   * $($SingleFailure)" -Severity 2 }
+									Write-Host "ApplyDriverPackage: WARNING - $($SingleSignificantFailures.Count) driver INF(s) failed to inject: $($SingleSignificantFailures -join ', ')"
+
+									if ($Script:FailOnDriverInjectionError) {
+										$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "$($SingleSignificantFailures.Count) driver INF(s) failed to inject: $($SingleSignificantFailures -join ', '). See '$($Script:DismLogPath)' and C:\Windows\INF\setupapi.offline.log for detail."))
 									}
 								}
 							}
 							else {
 								Write-CMLogEntry -Value " - An error occurred while enumerating driver paths, downloaded driver package does not contain any INF files" -Severity 3
-								Write-Host "ApplyDriverPackage: FATAL - Downloaded driver package contains no INF files in: $($ContentLocation)"
+								Write-Host "ApplyDriverPackage: FATAL - Downloaded driver package contains no INF files in: $($Script:DriverInjectionPath)"
 
 								# Throw terminating error
-								$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Downloaded driver package contains no INF files in: $($ContentLocation). Verify the driver package source has valid driver files."))
+								$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "Downloaded driver package contains no INF files in: $($Script:DriverInjectionPath). Verify the driver package source has valid driver files."))
 							}
 						}
 						catch [System.Exception] {
+							Clear-DriverPackageMount -MountPath $DriverPackageMountLocation
 							Write-CMLogEntry -Value " - An error occurred while installing drivers. See DISM.log for more details" -Severity 2
 							Write-Host "ApplyDriverPackage: FATAL - DISM driver injection failed: $($_.Exception.Message)"
 
@@ -2835,23 +3417,37 @@ Process {
 					}
 					"Recurse" {
 						Write-CMLogEntry -Value " - DriverInstallMode is currently set to: $($DriverInstallMode)" -Severity 1
-						
-						# Apply drivers recursively
-						$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:$($ContentLocation) /Recurse /ForceUnsigned /ScratchDir:`"$ScratchDir`""
-						
-						# Validate driver injection and write DISM summary
+						Write-CMLogEntry -Value " - Applying drivers recursively from: $($Script:DriverInjectionPath)" -Severity 1
+
+						$DismStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+						# Apply drivers recursively. The call is bounded by the runtime budget and heartbeats every 30 seconds with the
+						# trailing line of the DISM log, so a build that stalls here shows which driver it is sitting on.
+						$Script:CurrentPhase = "DISM /Add-Driver /Recurse"
+						Assert-RuntimeBudget -Phase "DISM /Add-Driver /Recurse"
+						try {
+							$ApplyDriverInvocation = Invoke-Executable -FilePath "dism.exe" -Arguments "/Image:$($TSEnvironment.Value('OSDTargetSystemDrive'))\ /Add-Driver /Driver:`"$($Script:DriverInjectionPath)`" /Recurse /ForceUnsigned /ScratchDir:`"$ScratchDir`" /LogPath:`"$($Script:DismLogPath)`"" -ProgressLogPath $Script:DismLogPath -Activity "dism.exe /Add-Driver /Recurse"
+						}
+						catch [System.TimeoutException] {
+							$DismStopwatch.Stop()
+							Write-CMLogEntry -Value " - Driver injection did not finish within the configured time limits; the task sequence is being released instead of waiting" -Severity 3
+							Clear-DriverPackageMount -MountPath $DriverPackageMountLocation
+							$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "DISM driver injection stopped after $([math]::Round($DismStopwatch.Elapsed.TotalSeconds)) second(s) in phase '$($Script:CurrentPhase)'. Last DISM log entry is recorded above. Raise -MaxRuntimeMinutes or set it to 0 if this package needs longer, and check the DISM log for the driver it was processing."))
+						}
+
+						$DismStopwatch.Stop()
+						Write-CMLogEntry -Value " - dism.exe completed in $([math]::Round($DismStopwatch.Elapsed.TotalSeconds, 1)) second(s) with exit code: $($ApplyDriverInvocation)" -Severity 1
+
+						# Validate driver injection. A non-zero code is expected when the package contains INFs DISM can never
+						# inject offline, so the log is parsed to separate those from real hardware driver failures.
 						if ($ApplyDriverInvocation -eq 0) {
-							Write-CMLogEntry -Value " - Successfully installed drivers recursively using dism.exe" -Severity 1
-							Write-Output "ApplyDriverPackage: DISM driver injection completed successfully (Exit Code: 0)"
+							Write-CMLogEntry -Value " - Successfully installed drivers recursively in driver package content location using dism.exe" -Severity 1
 						}
 						else {
-							Write-CMLogEntry -Value " - DISM driver injection completed with warning code: $($ApplyDriverInvocation). See DISM.log for details" -Severity 2
-							Write-Output "ApplyDriverPackage: DISM driver injection completed with warning code: $($ApplyDriverInvocation)"
+							Write-CMLogEntry -Value " - An error occurred while installing drivers. Continuing with warning code: $($ApplyDriverInvocation). See DISM.log for more details" -Severity 2
 						}
-						if ($FirmwareINFCount -gt 0) {
-							Write-CMLogEntry -Value " - [DISM Summary]: $($FirmwareINFCount) offline-incompatible INF file(s) safely skipped (firmware/DCH extensions)" -Severity 1
-							Write-Output "ApplyDriverPackage: [DISM Summary]: $($FirmwareINFCount) offline-incompatible INF file(s) safely skipped"
-						}
+
+						Write-DismInjectionSummary -ExitCode $ApplyDriverInvocation -LogPath $Script:DismLogPath -SourcePath $Script:DriverInjectionPath | Out-Null
 					}
 				}
 			}
@@ -2873,8 +3469,8 @@ Process {
 				}
 
 				# Apply drivers recursively from downloaded driver package location using pnputil
-				Write-CMLogEntry -Value " - Driver package content downloaded successfully, attempting to apply drivers using pnputil.exe from: $($ContentLocation)" -Severity 1
-				$PnpUtilInfPath = Join-Path -Path $ContentLocation -ChildPath "*.inf"
+				Write-CMLogEntry -Value " - Driver package content downloaded successfully, attempting to apply drivers using pnputil.exe from: $($Script:DriverInjectionPath)" -Severity 1
+				$PnpUtilInfPath = Join-Path -Path $Script:DriverInjectionPath -ChildPath "*.inf"
 				$ApplyDriverInvocation = Invoke-Executable -FilePath "pnputil.exe" -Arguments "/add-driver `"$($PnpUtilInfPath)`" /subdirs /install"
 
 				# Validate pnputil driver installation
@@ -2903,7 +3499,32 @@ Process {
 			}
 		}
 		
-		# Compressed WIM dismount cleanup is handled immediately in finally block after extraction
+		# Cleanup potential compressed driver package content
+		if ($null -ne $DriverPackageCompressedFile) {
+			switch -wildcard ($DriverPackageCompressedFile.Name) {
+				"*.wim" {
+					try {
+						# Attempt to dismount compressed driver package content WIM file
+						Write-CMLogEntry -Value " - Attempting to dismount driver package content WIM file: $($DriverPackageCompressedFile.Name)" -Severity 1
+						Write-CMLogEntry -Value " - Mount location: $($DriverPackageMountLocation)" -Severity 1
+						Dismount-WindowsImage -Path $DriverPackageMountLocation -Discard -ErrorAction Stop
+						Write-CMLogEntry -Value " - Successfully dismounted driver package content WIM file" -Severity 1
+
+						# Remove the now empty mount folder so stale mount directories stop collecting in the task sequence cache
+						if ((Test-Path -Path $DriverPackageMountLocation) -and ($null -eq (Get-ChildItem -Path $DriverPackageMountLocation -Force -ErrorAction SilentlyContinue))) {
+							Remove-Item -Path $DriverPackageMountLocation -Force -ErrorAction SilentlyContinue
+							Write-CMLogEntry -Value " - Removed driver package mount folder: $($DriverPackageMountLocation)" -Severity 1
+						}
+					}
+					catch [System.Exception] {
+						Write-CMLogEntry -Value " - Failed to dismount driver package content WIM file. Error message: $($_.Exception.Message)" -Severity 3
+						
+						# Throw terminating error						
+						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+					}
+				}
+			}
+		}
 	}
 	#endregion
 
@@ -3021,8 +3642,10 @@ Process {
 			Write-CMLogEntry -Value "[DriverPackageFallbackValidation]: Completed fallback driver package validation phase" -Severity 1
 		}
 		
-		# Output final matched package to SMSTS.log
-		if ($DriverPackageList.Count -ge 1) {
+		# Output final matched package to SMSTS.log. @() is required here: Confirm-DriverPackageList replaces the list with the
+		# single object returned by Select-Object -First 1, so a bare .Count on a single match reads back as nothing and this
+		# summary used to print "No driver package matched" on builds that had in fact matched and applied a package.
+		if (@($DriverPackageList).Count -ge 1) {
 			Write-Output "ApplyDriverPackage: MATCHED package '$($DriverPackageList[0].PackageName)' (ID: $($DriverPackageList[0].PackageID), Version: $($DriverPackageList[0].PackageVersion))"
 		}
 		else {
@@ -3117,6 +3740,7 @@ Process {
 				Write-CMLogEntry -Value "[DriverPackageInstall]: Completed driver package install phase" -Severity 1
 
 				# Record the installed package version to registry for future version checks
+				Write-CMLogEntry -Value " - Recording installed driver package: $($DriverPackageList[0].PackageID) version $($DriverPackageList[0].PackageVersion)" -Severity 1
 				$InstalledPackageID = $DriverPackageList[0].PackageID
 				$InstalledPackageVersion = $DriverPackageList[0].PackageVersion
 				$InstalledPackageName = $DriverPackageList[0].PackageName
@@ -3167,4 +3791,16 @@ End {
 
 	# Write final output to log file
 	Write-CMLogEntry -Value "[ApplyDriverPackage]: Completed Apply Driver Package process" -Severity 1
+
+	# Report total runtime so a build that merely felt slow can be compared against the budget instead of guessed at. This
+	# runs in the End block, which executes after a terminating error too, so a failed build records how long it spent.
+	if ($null -ne $Script:RuntimeWatch) {
+		$Script:RuntimeWatch.Stop()
+		$TotalRuntimeSeconds = [math]::Round($Script:RuntimeWatch.Elapsed.TotalSeconds, 1)
+		Write-CMLogEntry -Value "[ApplyDriverPackage]: Total runtime $($TotalRuntimeSeconds) second(s), last phase was '$($Script:CurrentPhase)'" -Severity 1
+		if ($Script:MaxRuntimeMinutes -gt 0) {
+			$RemainingBudgetSeconds = [math]::Round(($Script:MaxRuntimeMinutes * 60) - $Script:RuntimeWatch.Elapsed.TotalSeconds)
+			Write-CMLogEntry -Value "[ApplyDriverPackage]: Runtime budget was $($Script:MaxRuntimeMinutes) minute(s); $($RemainingBudgetSeconds) second(s) remaining" -Severity 1
+		}
+	}
 }
