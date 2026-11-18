@@ -130,7 +130,7 @@
 	Author:      Kevin Phillips
     Contact:     @kevinphillips
     Created:     2026-02-21
-    Updated:     2026-02-27
+    Updated:     2026-11-18
     
     Version history:
     1.0.0 - (2017-03-27) - Script created
@@ -309,6 +309,33 @@
 5.5.1 - (2026-08-06) - DISM ScratchDir parameter fix:
 - Added /ScratchDir parameter pointing to C:\Windows\Temp for DISM driver injection commands in BareMetal mode
 - Solves DISM error 112 (ERROR_DISK_FULL) when applying large driver packages (e.g., Dell Latitude 5540) on systems with limited WinPE RAM disk scratch space
+5.7.0 - (2026-11-18) - Drivers withheld from DISM on BareMetal builds (Dell Pro Max 16 MC16250 missing audio, field investigation):
+						 - ROOT CAUSE: since 5.6.0 the BareMetal step renamed every Class=Extension and Class=SoftwareComponent INF to
+						   *.skipped before DISM ran, on the premise that those classes cannot be injected into an offline image. The
+						   premise is wrong: both are ordinary driver packages that DISM stages into the offline driver store, and PnP
+						   applies them over the base driver at first boot. On the MC16250 package 90 of 301 INFs never reached DISM,
+						   36 of them audio (the Intel Smart Sound OEM extension IntcOED_OemLibPath, the Realtek SDCA/SoundWire
+						   extensions, Waves and Dolby APOs, the Realtek audio service and console), as well as the camera sensor
+						   extensions, the Intel graphics extension and Intel Graphics Software, and Intel DTT, Intel ME/LMS and NPU
+						   components. DISM reported success because it was never given them
+						 - The August 2026 build (changelog 5.6.0, commit 656367f) went further and still logs "Script version: 5.5.0":
+						   it excluded both classes in every mode, DriverUpdate included, and every INF named *_dch.inf, which takes
+						   out base drivers such as the Intel graphics driver iigd_dch.inf. It logged each one as "Skipping firmware INF"
+						 - Only Firmware INFs are excluded now, in every mode (the 5.5.0 Surface fix is unchanged). Every other INF is
+						   passed to DISM, and the log states how many Extension and SoftwareComponent INFs were passed
+						 - A failed Extension or SoftwareComponent INF is now reported as a driver failure, and counts towards
+						   -FailOnDriverInjectionError, instead of being filed as "expected". Failure lines name the setup class and
+						   setupapi code, and the summary states how many of the INFs under the injection source DISM staged
+						 - Devices built by an affected version carry a registry stamp that makes DriverUpdate skip them as up to date.
+						   Run DriverUpdate with -ForceUpdate (this version) on those devices to install the missing INFs. PARAMETERS.md
+						   has a detection script that finds affected devices from their ApplyDriverPackage.log
+						 - Registry stamps (BareMetal offline and DriverUpdate) now record ScriptVersion
+						 - Fixed XMLPackage mode carrying on without DriverPackages.xml: the terminating error shared a line with its
+						   comment, so it never ran
+						 - Fixed Get-ComputerData failing the step when the Dell SystemSku or OEMStringArray value, or the Lenovo model,
+						   is empty or too short. Those devices now fall back to model matching as designed
+						 - pnputil exit code 259 is logged as "no device needed an update" instead of "restart required"
+						 - Removed the unused Test-FirmwareDriverInf function
 5.6.3 - (2026-10-29) - Driver step failing 30 seconds into the download (Dell Pro Micro QCM1250 field investigation):
 						 - Fixed the 5.6.2 heartbeat failing the step it was reporting on. Invoke-Executable writes a heartbeat every 30
 						   seconds with the last line of -ProgressLogPath, but only the DISM calls pass that parameter and Get-LogTailText
@@ -533,7 +560,7 @@ param(
 	[ValidateRange(5, 1440)]
 	[int]$DownloadTimeoutMinutes = 45,
 
-	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Fail the task sequence when a real hardware driver INF fails to inject, instead of logging a warning and continuing.")]
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Fail the task sequence when any driver INF fails to inject (Extension and SoftwareComponent INFs included; excluded firmware INFs never count), instead of logging a warning and continuing.")]
 	[parameter(Mandatory = $false, ParameterSetName = "DriverUpdate")]
 	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
 	[parameter(Mandatory = $false, ParameterSetName = "PreCache")]
@@ -566,7 +593,7 @@ param(
 )
 Begin {
 	# Script version for logging and troubleshooting
-	$ScriptVersion = "5.6.3"
+	$ScriptVersion = "5.7.0"
 
 	# Network log retry state
 	$Script:NetworkLogFailures = 0
@@ -1080,8 +1107,10 @@ Process {
 				$script:XMLPackageLogicFile = (Join-Path -Path $TSEnvironment.Value("MDMXMLPackage01") -ChildPath "DriverPackages.xml")
 				if (-not (Test-Path -Path $XMLPackageLogicFile)) {
 					Write-CMLogEntry -Value " - Failed to locate required 'DriverPackages.xml' logic file for XMLPackage deployment type, ensure it has been pre-downloaded in a Download Package Content step before running this script" -Severity 3
-					
-					# Throw terminating error					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+
+					# Throw terminating error. This call used to share a line with the comment above, which commented it out and
+					# let the script carry on without its package list.
+					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord -Message "DriverPackages.xml was not found at '$($XMLPackageLogicFile)'. Download the XML package content (MDMXMLPackage01) in a Download Package Content step before this step."))
 				}
 			}
 			default {
@@ -1654,34 +1683,40 @@ Process {
 		$Win32CSP = Get-CimInstance -ClassName "Win32_ComputerSystemProduct"
 		$MSSystemInfo = Get-CimInstance -ClassName "MS_SystemInformation" -Namespace "root\WMI"
 
-		# Gather computer details based upon specific computer manufacturer
-		$ComputerManufacturer = $Win32CS.Manufacturer.Trim()
+		# Gather computer details based upon specific computer manufacturer. WMI values are read through [string] so a property
+		# the firmware left empty becomes an empty string. Calling .Trim() on the null used to throw out of this function and
+		# fail the step, where the intended behaviour is to fall back to model matching (see Test-ComputerDetails).
+		$ComputerManufacturer = ([string]$Win32CS.Manufacturer).Trim()
+		$ComputerModelValue = ([string]$Win32CS.Model).Trim()
 		switch -Wildcard ($ComputerManufacturer) {
 			"*Microsoft*" {
 				$ComputerDetails.Manufacturer = "Microsoft"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
+				$ComputerDetails.Model = $ComputerModelValue
 				# MS_SystemInformation.SystemSKU is the authoritative identifier for Surface devices (e.g. the Surface
-				# Pro 12th Edition with Intel reports Surface_Pro_for_Business_13in_12th_Ed_Intel_2103). Trim it and
-				# guard against a null value on devices that do not populate this class.
-				if (-not([string]::IsNullOrEmpty($MSSystemInfo.SystemSKU))) {
-					$ComputerDetails.SystemSKU = $MSSystemInfo.SystemSKU.Trim()
-				}
+				# Pro 12th Edition with Intel reports Surface_Pro_for_Business_13in_12th_Ed_Intel_2103)
+				$ComputerDetails.SystemSKU = ([string]$MSSystemInfo.SystemSKU).Trim()
 			}
 			"*Dell*" {
 				$ComputerDetails.Manufacturer = "Dell"
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
-				$ComputerDetails.SystemSKU = $MSSystemInfo.SystemSku.Trim()
-				[string]$OEMString = $Win32CS.OEMStringArray
-				$ComputerDetails.FallbackSKU = [regex]::Matches($OEMString, '\[\S*]')[0].Value.TrimStart("[").TrimEnd("]")
+				$ComputerDetails.Model = $ComputerModelValue
+				$ComputerDetails.SystemSKU = ([string]$MSSystemInfo.SystemSku).Trim()
+				# Fallback SKU from the first bracketed token of OEMStringArray, e.g. 0CF1 from '1[0CF1]'
+				$OEMSKUMatch = [regex]::Match([string]$Win32CS.OEMStringArray, '\[\S*]')
+				if ($OEMSKUMatch.Success) {
+					$ComputerDetails.FallbackSKU = $OEMSKUMatch.Value.TrimStart("[").TrimEnd("]")
+				}
 			}
 			"*Lenovo*" {
 				$ComputerDetails.Manufacturer = "Lenovo"
-				$ComputerDetails.Model = $Win32CSP.Version.Trim()
-				$ComputerDetails.SystemSKU = ($Win32CS.Model.SubString(0, 4)).Trim()
+				$ComputerDetails.Model = ([string]$Win32CSP.Version).Trim()
+				# The SystemSKU is the first four characters of the machine type model, e.g. 21CB from 21CBCTO1WW
+				if ($ComputerModelValue.Length -ge 4) {
+					$ComputerDetails.SystemSKU = $ComputerModelValue.Substring(0, 4).Trim()
+				}
 			}
 			Default {
-				$ComputerDetails.Manufacturer = $Win32CS.Manufacturer.Trim()
-				$ComputerDetails.Model = $Win32CS.Model.Trim()
+				$ComputerDetails.Manufacturer = $ComputerManufacturer
+				$ComputerDetails.Model = $ComputerModelValue
 			}
 		}
 		
@@ -2673,6 +2708,8 @@ Process {
 			Set-ItemProperty -Path $RegistryPath -Name "Version" -Value $PackageVersion -Type String -Force
 			Set-ItemProperty -Path $RegistryPath -Name "PackageName" -Value $PackageName -Type String -Force
 			Set-ItemProperty -Path $RegistryPath -Name "DateInstalled" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Type String -Force
+			# Which script version applied the package, so devices built by a faulty version can be found and remediated later
+			Set-ItemProperty -Path $RegistryPath -Name "ScriptVersion" -Value $Script:ScriptVersion -Type String -Force
 
 			# Parse and store version components for diagnostics
 			$VersionParts = Split-DriverPackageVersion -Version $PackageVersion
@@ -2750,6 +2787,8 @@ Process {
 				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v Version /t REG_SZ /d `"$($PackageVersion)`" /f" | Out-Null
 				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v PackageName /t REG_SZ /d `"$($PackageName)`" /f" | Out-Null
 				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v DateInstalled /t REG_SZ /d `"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`" /f" | Out-Null
+				# Which script version imaged the device, so builds made by a faulty version can be found and remediated later
+				Invoke-Executable -FilePath "reg.exe" -Arguments "add `"$($OfflineRegPath)`" /v ScriptVersion /t REG_SZ /d `"$($Script:ScriptVersion)`" /f" | Out-Null
 
 				# Parse and store version components for diagnostics
 				$VersionParts = Split-DriverPackageVersion -Version $PackageVersion
@@ -2862,62 +2901,30 @@ Process {
 		}
 	}
 	
-	function Test-FirmwareDriverInf {
+	function Get-DriverInfSetupClass {
 		param (
 			[parameter(Mandatory = $true, HelpMessage = "Specify the full path to the driver INF file to inspect.")]
 			[ValidateNotNullOrEmpty()]
 			[string]$Path
 		)
-		# Surface driver/firmware packages include firmware update components whose INF files declare the Firmware
-		# setup class (Class=Firmware / ClassGuid {f2e7dd72-6468-4e36-b6f1-6488f42c1b52}). These cannot be injected
-		# into an offline image with DISM /Add-Driver and previously caused driver application to error out, so they
-		# must be skipped. Returns $true when the INF is a firmware update package.
+		# Returns the setup class declared by the INF: 'Firmware' for a firmware update INF (Class=Firmware, or the firmware
+		# ClassGuid {f2e7dd72-6468-4e36-b6f1-6488f42c1b52}), otherwise the Class value as written, an empty string when the
+		# INF declares no Class, or $null when the INF cannot be read.
+		#
+		# Firmware is the only setup class this script excludes. Extension INFs (Class=Extension) and software component INFs
+		# (Class=SoftwareComponent) are ordinary, standalone driver packages: DISM stages them into the offline driver store
+		# like any other INF, and PnP applies them on top of the base driver when the device is installed at first boot.
+		# They carry the OEM-specific part of the audio, camera, graphics and chipset drivers. 5.6.0 to 5.6.3 excluded both
+		# classes from offline injection, which left builds from those versions without the OEM audio stack.
 		try {
 			$InfContent = Get-Content -Path $Path -Raw -ErrorAction Stop
-			if ($InfContent -match "(?im)^\s*Class\s*=\s*Firmware\b") {
-				return $true
-			}
-			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") {
-				return $true
-			}
-			return $false
-		}
-		catch [System.Exception] {
-			# If the INF cannot be read, do not treat it as firmware so normal injection still attempts it
-			Write-CMLogEntry -Value " - WARNING: Unable to read INF for firmware classification: $($Path). Error: $($_.Exception.Message)" -Severity 2
-			return $false
-		}
-	}
-
-	function Get-NonInjectableDriverInfReason {
-		param (
-			[parameter(Mandatory = $true, HelpMessage = "Specify the full path to the driver INF file to inspect.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$Path,
-
-			[parameter(Mandatory = $false, HelpMessage = "Include the SoftwareComponent and Extension setup classes. Use for offline injection only: an online pnputil install can apply those normally.")]
-			[switch]$IncludeComponentClasses
-		)
-		# Returns the setup class that makes an INF unusable for injection, or $null when the INF can be injected.
-		# Firmware INFs are rejected by DISM /Add-Driver; SoftwareComponent and Extension INFs (Intel DTT, Intel IPF,
-		# Intel ME LMS/WMI provider, Realtek and Waves APOs, Intel graphics components) also cannot be applied to an
-		# offline image and only produce "the driver package could not be installed" noise in the log. Those component
-		# classes do install on a running OS, so they are only excluded with -IncludeComponentClasses.
-		$SetupClasses = @("Firmware")
-		if ($IncludeComponentClasses) {
-			$SetupClasses += @("SoftwareComponent", "Extension")
-		}
-		try {
-			$InfContent = Get-Content -Path $Path -Raw -ErrorAction Stop
-			foreach ($SetupClass in $SetupClasses) {
-				if ($InfContent -match "(?im)^\s*Class\s*=\s*$($SetupClass)\b") {
-					return $SetupClass
-				}
-			}
 			if ($InfContent -match "(?im)^\s*ClassGuid\s*=\s*\{?f2e7dd72-6468-4e36-b6f1-6488f42c1b52\}?") {
 				return "Firmware"
 			}
-			return $null
+			if ($InfContent -match "(?im)^\s*Class\s*=\s*`"?([A-Za-z0-9_]+)") {
+				return $Matches[1]
+			}
+			return [string]::Empty
 		}
 		catch [System.Exception] {
 			# If the INF cannot be read, do not classify it: normal injection should still attempt it
@@ -2933,34 +2940,35 @@ Process {
 			[string]$Path,
 
 			[parameter(Mandatory = $false, HelpMessage = "Set to True when the content path can be renamed (a writable copy rather than a read-only mount).")]
-			[bool]$Writable = $true,
-
-			[parameter(Mandatory = $false, HelpMessage = "Also exclude the SoftwareComponent and Extension setup classes. Correct for offline DISM injection, wrong for an online pnputil install.")]
-			[switch]$IncludeComponentClasses
+			[bool]$Writable = $true
 		)
 		$ExcludedCount = 0
 		$ReadOnlyCount = 0
 		$FailedCount = 0
-		$ReadOnlyClasses = @{}
-		$ContentINFs = Get-ChildItem -Path $Path -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue
-		Write-CMLogEntry -Value " - Scanning $((@($ContentINFs)).Count) INF file(s) for setup classes that cannot be injected" -Severity 1
+		$ExtensionCount = 0
+		$ComponentCount = 0
+		$ContentINFs = @(Get-ChildItem -Path $Path -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue)
+		Write-CMLogEntry -Value " - Scanning $($ContentINFs.Count) INF file(s) for firmware update INFs to exclude" -Severity 1
 
 		foreach ($ContentINF in $ContentINFs) {
-			$Reason = Get-NonInjectableDriverInfReason -Path $ContentINF.FullName -IncludeComponentClasses:$IncludeComponentClasses
-			if ([string]::IsNullOrEmpty($Reason)) { continue }
+			$SetupClass = Get-DriverInfSetupClass -Path $ContentINF.FullName
+
+			# Counted so the log shows the OEM customisation INFs were handed to the installer, not withheld as in 5.6.x
+			if ($SetupClass -eq "Extension") { $ExtensionCount++ }
+			elseif ($SetupClass -eq "SoftwareComponent") { $ComponentCount++ }
+
+			if ($SetupClass -ne "Firmware") { continue }
 
 			if (-not $Writable) {
-				# Read-only source (mounted WIM): nothing to rename. DISM will report these as skipped and
-				# Write-DismInjectionSummary classifies them as expected rather than as driver failures. Counted by
-				# setup class and reported once: a Latitude 5530 package holds 61 of them, which used to print 61 lines.
+				# Read-only source (mounted WIM, -InjectFromMount): nothing can be renamed, so DISM is handed the firmware INFs
+				# and Write-DismInjectionSummary reports any it rejects as expected rather than as driver failures
 				$ReadOnlyCount++
-				if ($ReadOnlyClasses.ContainsKey($Reason)) { $ReadOnlyClasses[$Reason]++ } else { $ReadOnlyClasses[$Reason] = 1 }
 				continue
 			}
 
 			try {
-				Write-CMLogEntry -Value " - Excluding non-injectable $($Reason) INF from driver injection: $($ContentINF.FullName)" -Severity 1
-				Rename-Item -Path $ContentINF.FullName -NewName "$($ContentINF.Name).$($Reason.ToLower()).skipped" -Force -ErrorAction Stop
+				Write-CMLogEntry -Value " - Excluding firmware INF from driver injection: $($ContentINF.FullName)" -Severity 1
+				Rename-Item -Path $ContentINF.FullName -NewName "$($ContentINF.Name).firmware.skipped" -Force -ErrorAction Stop
 				$ExcludedCount++
 			}
 			catch [System.Exception] {
@@ -2972,13 +2980,13 @@ Process {
 		}
 
 		if ($ReadOnlyCount -gt 0) {
-			$ClassSummary = (($ReadOnlyClasses.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Value) $($_.Name)" }) -join ", ")
-			Write-CMLogEntry -Value " - $($ReadOnlyCount) non-injectable INF(s) left in place on the read-only source ($($ClassSummary)): DISM skips them and they are reported as expected" -Severity 1
+			Write-CMLogEntry -Value " - $($ReadOnlyCount) firmware INF(s) left in place on the read-only source: any that DISM rejects are reported as expected" -Severity 1
 		}
 
-		Write-CMLogEntry -Value " - Driver INF exclusion summary: $($ExcludedCount) excluded, $($ReadOnlyCount) left for DISM to skip, $($FailedCount) failed to exclude" -Severity 1
+		Write-CMLogEntry -Value " - Firmware INF exclusion summary: $($ExcludedCount) excluded, $($ReadOnlyCount) left on a read-only source, $($FailedCount) failed to exclude" -Severity 1
+		Write-CMLogEntry -Value " - $($ContentINFs.Count - $ExcludedCount) INF(s) will be passed to driver injection, including $($ExtensionCount) Extension and $($ComponentCount) SoftwareComponent INF(s)" -Severity 1
 		if ($ExcludedCount -gt 0) {
-			Write-Host "ApplyDriverPackage: Excluded $($ExcludedCount) non-injectable INF(s) from driver injection"
+			Write-Host "ApplyDriverPackage: Excluded $($ExcludedCount) firmware INF(s) from driver injection"
 		}
 	}
 
@@ -2996,10 +3004,10 @@ Process {
 		)
 		# DISM never names the INF it failed on in its console summary, so the log is the only place the names exist.
 		# Failures are worked out by comparing the INFs found under the injection source against the ones DISM reports as
-		# successfully processed, with error lines used as a cross check. The results are then split into expected
-		# (setup classes that cannot be injected offline) and significant (real hardware drivers) so that one genuine
-		# storage, network or display driver failure stays visible instead of drowning in the sixteen or so component
-		# INFs that every modern Dell or Lenovo package also contains.
+		# successfully processed, with error lines used as a cross check. Only firmware INFs left on a read-only source count
+		# as expected. Every other failure is significant and is reported with its setup class and setupapi code: an Extension
+		# or SoftwareComponent INF that fails is an OEM audio, camera, graphics or chipset customisation missing from the build,
+		# and filing those under "expected" is how 5.6.x hid an incomplete audio stack.
 		$FailedINFs = [System.Collections.Generic.List[string]]::new()
 		$ProcessedINFs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 		$ErrorCodes = @{}
@@ -3030,6 +3038,9 @@ Process {
 				}
 			}
 			Write-CMLogEntry -Value " - DISM log '$($LogPath)': $($ProcessedINFs.Count) driver package(s) processed, $($FailedINFs.Count) error line(s) referencing an INF" -Severity 1
+			if ($ProcessedINFs.Count -eq 0) {
+				Write-CMLogEntry -Value " - WARNING: The DISM log records no processed driver package, so which INFs were staged cannot be verified" -Severity 2
+			}
 		}
 		else {
 			Write-CMLogEntry -Value " - WARNING: DISM log not found at '$($LogPath)', INF-level failures cannot be identified" -Severity 2
@@ -3039,12 +3050,17 @@ Process {
 		# comparison when the log actually contains processed entries: an empty or rotated log would otherwise make every
 		# driver in the package look like a failure.
 		if (($ProcessedINFs.Count -gt 0) -and (-not([string]::IsNullOrEmpty($SourcePath))) -and (Test-Path -Path $SourcePath)) {
-			$SourceINFs = Get-ChildItem -Path $SourcePath -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue
+			$SourceINFs = @(Get-ChildItem -Path $SourcePath -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue)
+			$StagedSourceCount = 0
 			foreach ($SourceINF in $SourceINFs) {
-				if (-not($ProcessedINFs.Contains($SourceINF.FullName))) {
+				if ($ProcessedINFs.Contains($SourceINF.FullName)) {
+					$StagedSourceCount++
+				}
+				else {
 					$FailedINFs.Add($SourceINF.FullName)
 				}
 			}
+			Write-CMLogEntry -Value " - DISM staged $($StagedSourceCount) of $($SourceINFs.Count) INF(s) found under the injection source" -Severity 1
 		}
 
 		$ExpectedFailures = [System.Collections.Generic.List[string]]::new()
@@ -3059,32 +3075,35 @@ Process {
 			if ($SeenINFs.Contains($FailedINF.ToLower())) { continue }
 			$SeenINFs.Add($FailedINF.ToLower())
 
-			$Reason = $null
+			$SetupClass = $null
 			if (Test-Path -Path $FailedINF) {
-				$Reason = Get-NonInjectableDriverInfReason -Path $FailedINF -IncludeComponentClasses
+				$SetupClass = Get-DriverInfSetupClass -Path $FailedINF
 			}
 
-			if ([string]::IsNullOrEmpty($Reason)) {
-				# Name the setupapi result where the log carried one: "could not be installed" alone is not diagnosable
-				if ($ErrorCodes.ContainsKey($FailedINF.ToLower())) {
-					$SignificantFailures.Add("$($FailedINF) [$($ErrorCodes[$FailedINF.ToLower()])]")
-				}
-				else {
-					$SignificantFailures.Add($FailedINF)
-				}
+			if ($SetupClass -eq "Firmware") {
+				$ExpectedFailures.Add("$($FailedINF) [Firmware]")
 			}
 			else {
-				$ExpectedFailures.Add("$($FailedINF) [$($Reason)]")
+				# Name the setup class and the setupapi result where known: "could not be installed" alone is not diagnosable,
+				# and the class shows at a glance whether the failure is an OEM extension (audio, camera) or a base driver
+				$FailureDetail = $FailedINF
+				if (-not([string]::IsNullOrEmpty($SetupClass))) {
+					$FailureDetail = "$($FailureDetail) [$($SetupClass)]"
+				}
+				if ($ErrorCodes.ContainsKey($FailedINF.ToLower())) {
+					$FailureDetail = "$($FailureDetail) [$($ErrorCodes[$FailedINF.ToLower()])]"
+				}
+				$SignificantFailures.Add($FailureDetail)
 			}
 		}
 
 		if ($ExpectedFailures.Count -gt 0) {
-			Write-CMLogEntry -Value " - $($ExpectedFailures.Count) INF(s) not injected, all of a setup class that cannot be applied offline (expected, no action required):" -Severity 1
+			Write-CMLogEntry -Value " - $($ExpectedFailures.Count) firmware INF(s) on the read-only source were not injected (expected, firmware is excluded by design):" -Severity 1
 			foreach ($Item in $ExpectedFailures) { Write-CMLogEntry -Value "   * $($Item)" -Severity 1 }
 		}
 
 		if ($SignificantFailures.Count -gt 0) {
-			Write-CMLogEntry -Value " - $($SignificantFailures.Count) injectable driver INF(s) failed to inject:" -Severity 2
+			Write-CMLogEntry -Value " - $($SignificantFailures.Count) driver INF(s) failed to inject:" -Severity 2
 			foreach ($Item in $SignificantFailures) { Write-CMLogEntry -Value "   * $($Item)" -Severity 2 }
 			Write-CMLogEntry -Value " - INF-level detail: '$($LogPath)'. Per-device detail: C:\Windows\INF\setupapi.offline.log in the target image" -Severity 2
 			Write-Host "ApplyDriverPackage: WARNING - $($SignificantFailures.Count) driver INF(s) failed to inject: $($SignificantFailures -join ', ')"
@@ -3094,8 +3113,14 @@ Process {
 			}
 		}
 		elseif ($ExitCode -ne 0) {
-			Write-CMLogEntry -Value " - DISM returned $($ExitCode) but no injectable driver failed: every remaining failure is a component or firmware INF that cannot be applied to an offline image" -Severity 1
-			Write-Host "ApplyDriverPackage: DISM returned $($ExitCode) - only non-injectable component/firmware INFs failed, no action required"
+			if ($ExpectedFailures.Count -gt 0) {
+				Write-CMLogEntry -Value " - DISM returned $($ExitCode) but the only INFs it did not stage are firmware INFs, which are excluded by design" -Severity 1
+				Write-Host "ApplyDriverPackage: DISM returned $($ExitCode) - only firmware INFs failed, no action required"
+			}
+			else {
+				Write-CMLogEntry -Value " - WARNING: DISM returned $($ExitCode) but its log does not identify a failed INF. Review '$($LogPath)'" -Severity 2
+				Write-Host "ApplyDriverPackage: WARNING - DISM returned $($ExitCode) without naming a failed INF, see $($LogPath)"
+			}
 		}
 
 		return $SignificantFailures
@@ -3109,7 +3134,7 @@ Process {
 		)
 
 		# Drivers are injected from this path. For zip/exe/cab/MSI sources it is the extracted content folder; for a WIM source
-		# it is the read-only mount, unless the package needs a writable copy (see the *.wim case below).
+		# it is a local copy of the mounted image, or the read-only mount itself with -InjectFromMount (see the *.wim case below).
 		$Script:DriverInjectionPath = $ContentLocation
 
 		# DISM writes INF-level detail to this log. Without /LogPath the detail lands in X:\Windows\Logs\DISM\dism.log, which is
@@ -3285,14 +3310,14 @@ Process {
 						# because it drops the copy, but DISM then reads every payload file through WIM decompression: on a Latitude 5530
 						# package that doubled INF enumeration (25 s against 14 s) and made the graphics package take 43.6 s instead of
 						# 8.9-11.4 s from a local copy, which more than paid back the copy it saved. The writable copy is also what lets
-						# the non-injectable INF exclusion rename files out of the *.inf pattern. -InjectFromMount restores the old
+						# the firmware INF exclusion rename files out of the *.inf pattern. -InjectFromMount restores the old
 						# read-only-mount behaviour for anyone who wants to measure it on their own packages.
 						$CopyMountToContent = -not $Script:InjectFromMount
 
 						if ($CopyMountToContent) {
 							$Script:CurrentPhase = "copying the mounted WIM to local disk"
 							Assert-RuntimeBudget -Phase "copying the mounted WIM to local disk"
-							Write-CMLogEntry -Value " - Copying items from mount directory (writable copy required for INF exclusion)" -Severity 1
+							Write-CMLogEntry -Value " - Copying items from mount directory (writable copy required for firmware INF exclusion)" -Severity 1
 							$CopyStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 							Get-ChildItem -Path $DriverPackageMountLocation | Copy-Item -Destination $ContentLocation -Recurse -Container -ErrorAction Stop
 							$CopyStopwatch.Stop()
@@ -3328,16 +3353,15 @@ Process {
 			}
 		}
 		
-		# Exclude driver INFs that cannot be injected. Firmware INFs (e.g. Microsoft Surface firmware components) and the
-		# SoftwareComponent/Extension setup classes cannot be applied to an offline image with DISM /Add-Driver, and firmware
-		# INFs are also picked up by pnputil during DriverUpdate. Renaming them out of the "*.inf" pattern excludes them from
-		# every injection method (DISM /Recurse, per-INF DISM and pnputil /subdirs) without deleting any content. When the
-		# injection source is a read-only mount there is nothing to rename, so the INFs are logged and DISM reports them as
-		# skipped, which Write-DismInjectionSummary then classifies as expected.
-		# Component classes are only excluded for offline DISM injection; an online pnputil install can apply them normally
+		# Exclude firmware update INFs (Class=Firmware, e.g. the firmware components in Microsoft Surface MSIs). This script does
+		# not stage firmware updates, and on Surface packages these INFs made the apply step error out (5.5.0). Renaming them out
+		# of the "*.inf" pattern excludes them from every injection method (DISM /Recurse, per-INF DISM and pnputil /subdirs)
+		# without deleting any content. When the injection source is a read-only mount there is nothing to rename, so DISM is
+		# handed them and Write-DismInjectionSummary classifies any it rejects as expected.
+		# Every other setup class is injected in every mode, Extension and SoftwareComponent included: they hold the OEM part of
+		# the audio, camera, graphics and chipset drivers, and the offline driver store accepts them like any other INF.
 		$InjectionSourceIsWritable = ($Script:DriverInjectionPath -eq $ContentLocation)
-		$OfflineInjection = ($Script:DeploymentMode -eq "BareMetal")
-		Set-DriverContentExclusion -Path $Script:DriverInjectionPath -Writable $InjectionSourceIsWritable -IncludeComponentClasses:$OfflineInjection
+		Set-DriverContentExclusion -Path $Script:DriverInjectionPath -Writable $InjectionSourceIsWritable
 
 		switch ($Script:DeploymentMode) {
 			"BareMetal" {
@@ -3374,22 +3398,22 @@ Process {
 										Write-CMLogEntry -Value " - Successfully installed driver using dism.exe" -Severity 1
 									}
 									else {
-										# Expected for setup classes that cannot be applied offline; significant otherwise
-										$SingleReason = Get-NonInjectableDriverInfReason -Path $DriverINF.FullName -IncludeComponentClasses
-										if ([string]::IsNullOrEmpty($SingleReason)) {
-											$SingleSignificantFailures.Add($DriverINF.FullName)
-											Write-CMLogEntry -Value " - An error occurred while installing driver. Continuing with warning code: $($ApplyDriverInvocation). See DISM.log for more details" -Severity 2
+										# Expected only for a firmware INF left on a read-only source; every other failure is significant
+										$SingleSetupClass = Get-DriverInfSetupClass -Path $DriverINF.FullName
+										if ($SingleSetupClass -eq "Firmware") {
+											$SingleExpectedCount++
+											Write-CMLogEntry -Value " - Firmware INF was not injected (expected, firmware is excluded by design)" -Severity 1
 										}
 										else {
-											$SingleExpectedCount++
-											Write-CMLogEntry -Value " - Skipped $($SingleReason) INF, this setup class cannot be applied to an offline image (expected)" -Severity 1
+											$SingleSignificantFailures.Add($DriverINF.FullName)
+											Write-CMLogEntry -Value " - An error occurred while installing driver. Continuing with warning code: $($ApplyDriverInvocation). See '$($Script:DismLogPath)' for more details" -Severity 2
 										}
 									}
 								}
 
-								Write-CMLogEntry -Value " - Driver injection summary: $($SingleSuccessCount) installed, $($SingleExpectedCount) skipped as non-injectable, $($SingleSignificantFailures.Count) failed" -Severity 1
+								Write-CMLogEntry -Value " - Driver injection summary: $($SingleSuccessCount) installed, $($SingleExpectedCount) firmware INF(s) not injected, $($SingleSignificantFailures.Count) failed" -Severity 1
 								if ($SingleSignificantFailures.Count -gt 0) {
-									Write-CMLogEntry -Value " - $($SingleSignificantFailures.Count) injectable driver INF(s) failed to inject:" -Severity 2
+									Write-CMLogEntry -Value " - $($SingleSignificantFailures.Count) driver INF(s) failed to inject:" -Severity 2
 									foreach ($SingleFailure in $SingleSignificantFailures) { Write-CMLogEntry -Value "   * $($SingleFailure)" -Severity 2 }
 									Write-Host "ApplyDriverPackage: WARNING - $($SingleSignificantFailures.Count) driver INF(s) failed to inject: $($SingleSignificantFailures -join ', ')"
 
@@ -3478,7 +3502,9 @@ Process {
 					Write-CMLogEntry -Value " - Successfully installed drivers using pnputil.exe" -Severity 1
 				}
 				elseif ($ApplyDriverInvocation -eq 259) {
-					Write-CMLogEntry -Value " - Drivers installed successfully. A system restart is required to complete installation (exit code: 259)" -Severity 2
+					# ERROR_NO_MORE_ITEMS. It does not mean a restart is pending: no device matched the drivers, or every matching
+					# device already uses a better or newer driver. Normal when a package that is already installed is applied again.
+					Write-CMLogEntry -Value " - No device needed a driver update: no device matches these drivers, or every matching device already uses a better or newer driver (exit code: 259)" -Severity 1
 				}
 				elseif ($ApplyDriverInvocation -eq 3010) {
 					Write-CMLogEntry -Value " - Drivers installed successfully. A system restart is required to complete installation (exit code: 3010)" -Severity 2
