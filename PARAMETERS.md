@@ -1,6 +1,8 @@
 # Invoke-CMApplyDriverPackage.ps1 — Parameter Reference
 
-Reference guide for `Invoke-CMApplyDriverPackage.ps1` (v5.5.0). Covers every parameter, what it does, and when to use it.
+Reference guide for `Invoke-CMApplyDriverPackage.ps1` (v5.7.0). Covers every parameter, what it does, and when to use it.
+
+> **Devices imaged with v5.6.x builds, including the August 2026 build that logs itself as 5.5.0, are missing drivers (no audio is the usual symptom).** See [Known Issue: Devices Imaged With v5.6.x](#known-issue-devices-imaged-with-v56x) for how to find and fix them without reimaging.
 
 ---
 
@@ -61,6 +63,10 @@ These tell the script what driver package to look for.
 | `-DriverInstallMode <mode>` | `Recurse` | `Recurse` runs one DISM command across the whole driver folder (faster). `Single` spawns one DISM call per `.inf` (more verbose, slower, useful for debugging individual driver failures). |
 | `-PreCachePath <path>` | CCMCache | **PreCache mode only.** Override the cache path used to stage drivers. |
 | `-ForceUpdate` | off | **DriverUpdate/Debug only.** Bypass the "is this version already installed" check and reinstall anyway. Use when a previous install was incomplete. |
+| `-FailOnDriverInjectionError` | off | Fail the step when any driver INF fails to inject, instead of logging a warning and continuing. As of v5.7.0 this includes Extension and SoftwareComponent INFs (audio, camera, graphics and chipset customisations). Excluded firmware INFs never count. |
+| `-InjectFromMount` | off | Inject straight from the mounted WIM instead of copying it to local disk first. Measured slower on 3–4 GB Dell packages, and firmware INFs can't be excluded from a read-only mount. Leave it off. |
+| `-DownloadTimeoutMinutes <n>` | `45` | Stop waiting for the package download after this many minutes and fail the step. Range 5–1440. |
+| `-MaxRuntimeMinutes <n>` | `60` | Time budget for the whole step. When it runs out, the step fails and the log names the phase it was stuck in. `0` disables the budget. |
 
 ---
 
@@ -69,6 +75,7 @@ These tell the script what driver package to look for.
 | Parameter | Description |
 |---|---|
 | `-NetworkLogPath <UNC>` | Writes a duplicate of `ApplyDriverPackage.log` to a UNC path for remote troubleshooting. Example: `\\fileserver\share\OSDLogs`. The script appends the computer name to the file. **Highly recommended for any TS step you might need to debug remotely.** |
+| `OSDApplyDriverPackageNetworkLog` (TS variable) | Same as `-NetworkLogPath`, but set once in a Set Task Sequence Variable step so every driver step mirrors its log without editing each command line. `-NetworkLogPath` on the command line wins when both are set. In WinPE the computer name in the file name is the temporary `MININT-...` name. |
 
 ---
 
@@ -145,7 +152,7 @@ For dry-run testing the script during a TS on a Hyper-V VM **without** downloadi
 
 Added in v5.5.0. The device is matched by **SystemSKU** (read from `MS_SystemInformation`). Driver content is the Microsoft Surface MSI, which the script extracts automatically during apply.
 
-> **Firmware files are skipped automatically.** The Surface MSI contains firmware update components (INFs with `Class=Firmware`) alongside the real device drivers. Those firmware INFs cannot be injected into an offline image and previously caused the apply step to error out. As of v5.5.0 the script detects them and excludes them from injection in every apply mode (BareMetal DISM and DriverUpdate pnputil), so only the actual hardware drivers are applied. The exclusions are logged to `ApplyDriverPackage.log` as `Skipping firmware INF ...`.
+> **Firmware files are skipped automatically.** The Surface MSI contains firmware update components (INFs with `Class=Firmware`) alongside the real device drivers. Those firmware INFs previously caused the apply step to error out. As of v5.5.0 the script detects them and excludes them from injection in every apply mode (BareMetal DISM and DriverUpdate pnputil), so only the actual hardware drivers are applied. The exclusions are logged to `ApplyDriverPackage.log` as `Excluding firmware INF from driver injection: ...`. Firmware is the only thing the script excludes; see [What Gets Injected](#what-gets-injected).
 
 | Identifier | Value |
 |---|---|
@@ -186,6 +193,52 @@ Added in v5.5.0. The device is matched by **SystemSKU** (read from `MS_SystemInf
 ```powershell
 .\Invoke-CMApplyDriverPackage.ps1 -DebugMode -Endpoint CHMCSCCM.methodistcol.corp -UserName "METHODISTCOL\svc.MECM.ReadOnlyAna" -Password "P@ssw0rd" -TargetOSName "Windows 11" -TargetOSVersion 24H2 -Manufacturer Microsoft -ComputerModel "Surface Pro for Business 13in 12th Ed Intel" -SystemSKU Surface_Pro_for_Business_13in_12th_Ed_Intel_2103
 ```
+
+---
+
+# What Gets Injected
+
+Every INF in the driver package goes to DISM (BareMetal) or pnputil (DriverUpdate), **except firmware update INFs** (`Class=Firmware`). Those are renamed to `*.inf.firmware.skipped` and logged as `Excluding firmware INF from driver injection: ...`.
+
+That includes the **Extension** and **SoftwareComponent** INFs. They are the manufacturer's layer on top of the base drivers. On a current Dell that means the Intel Smart Sound and Realtek SDCA audio extensions, the Waves and Dolby audio effects, the Realtek audio service, the camera sensor extensions, the Intel graphics extension and Intel Graphics Software, Intel DTT and the Intel ME services. Without them the hardware doesn't work as shipped, and audio is usually the first thing users notice.
+
+After injection, `ApplyDriverPackage.log` shows two lines like these (Dell Pro Max 16 MC16250 package). On a clean build the two numbers match:
+
+```
+ - 301 INF(s) will be passed to driver injection, including 63 Extension and 27 SoftwareComponent INF(s)
+ - DISM staged 301 of 301 INF(s) found under the injection source
+```
+
+If DISM staged fewer INFs than it was given, the missing ones are listed under `driver INF(s) failed to inject`, each with its setup class and error code.
+
+---
+
+# Known Issue: Devices Imaged With v5.6.x
+
+**Symptom:** no sound after imaging. The camera, Intel Graphics Software, Intel DTT or Intel ME (LMS) components are often missing as well. Device Manager can look mostly clean, because what's missing is the extension and software component packages rather than the base drivers.
+
+**Cause:** these builds removed driver INFs from the package before DISM ran, because they wrongly treated Extension and SoftwareComponent INFs as impossible to inject offline. On a Dell Pro Max 16 MC16250, v5.6.3 withheld 90 of 301 INFs, 36 of them audio. DISM still reported success because it was never given those INFs. Fixed in v5.7.0.
+
+| Build | What its log shows | What it withheld |
+|---|---|---|
+| v5.6.x (Oct–Nov 2026) | `Script version: 5.6.x` and `Excluding non-injectable Extension INF ...` | Extension and SoftwareComponent INFs, BareMetal only |
+| August 2026 build (commit `656367f`) | `Script version: 5.5.0` (not bumped) and `offline-incompatible INF file(s) safely skipped` | Extension and SoftwareComponent INFs **and every `*_dch.inf`** (which includes the Intel graphics base driver), in every mode, DriverUpdate included. Each one is logged as `Skipping firmware INF`. |
+
+**Check a device:** this returns `True` when the device's `ApplyDriverPackage.log` (kept under `C:\Windows\CCM\Logs`) shows either build's exclusions. It works as a ConfigMgr **Run Script** against a collection. Run it *before* remediating, because the log keeps the old lines afterwards.
+
+```powershell
+[bool](Get-ChildItem -Path "$env:windir\CCM\Logs" -Filter "ApplyDriverPackage*.log" -Recurse -ErrorAction SilentlyContinue |
+    Select-String -Pattern 'Excluding non-injectable (Extension|SoftwareComponent) INF|offline-incompatible INF file' -List |
+    Select-Object -First 1)
+```
+
+**Fix without reimaging:** run the DriverUpdate step with v5.7.0 and `-ForceUpdate`, then restart:
+
+```
+-DriverUpdate -Endpoint CHMCSCCM.methodistcol.corp -TargetOSName "Windows 11" -ForceUpdate
+```
+
+`-ForceUpdate` is required. The build wrote a registry stamp (`HKLM\SOFTWARE\MSEndpointMgr\DriverPackage`) that otherwise makes DriverUpdate skip the device as already up to date. From v5.7.0 the stamp also records `ScriptVersion`, so a future problem like this can be targeted by version.
 
 ---
 
